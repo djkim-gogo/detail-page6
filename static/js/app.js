@@ -256,6 +256,32 @@ function handlePageStreamEvent(ev) {
         "이미지 생성 API 전달 프롬프트 (제품 사진 + 문구):",
         sd.image_prompt);
     }
+    if (baseStep === "overlay_refine") {
+      const row = stepRows[stepKey];
+      if (row) {
+        row.result.style.display = "block";
+        // 사용 AI 모델 선택 (재실행에 사용)
+        addOverlayRefineModelSelect(row, sd);
+        // API 호출 전에 "다듬기 전 OCR 정보로 합성한 결과 미리보기" 표시
+        const inputLines = sd.input_lines || [];
+        const base = sd.base_image_b64;
+        row.result.querySelectorAll(".prerefine-preview-block").forEach((el) => el.remove());
+        if (base && inputLines.length) {
+          const block = document.createElement("div");
+          block.className = "prerefine-preview-block persistent-on-rerun";
+          block.style.cssText = "margin-top:6px";
+          const lab = document.createElement("div");
+          lab.style.cssText = "font-weight:600;font-size:13px";
+          lab.textContent = "다듬기 전 OCR 정보로 합성한 결과 미리보기:";
+          block.appendChild(lab);
+          const preview = document.createElement("div");
+          preview.style.cssText = "margin-top:4px;display:inline-block;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden";
+          block.appendChild(preview);
+          renderLabelsAsDOM(base, inputLines, preview, { maxWidth: "540px" });
+          row.result.appendChild(block);
+        }
+      }
+    }
     if (baseStep === "image_gen_text") {
       if (Array.isArray(sd.available_options) && sd.available_options.length) {
         const row = stepRows[stepKey];
@@ -329,6 +355,7 @@ function handlePageStreamEvent(ev) {
       thumb.style.marginTop = "4px";
       thumb.style.border = "1px solid #e5e7eb";
       thumb.style.borderRadius = "6px";
+      attachImageOpenInNewTab(thumb);
       row.result.appendChild(note);
       row.result.appendChild(thumb);
     } else if (baseStep === "image_gen_ocr") {
@@ -356,16 +383,33 @@ function handlePageStreamEvent(ev) {
     } else if (baseStep === "overlay_refine") {
       const inputLines = d.input_lines || [];
       const base = d.base_image_b64;
+      // 다듬기 전 미리보기 블록 (재실행 시 보존)
+      row.result.querySelectorAll(".prerefine-preview-block").forEach((el) => el.remove());
       if (base && inputLines.length) {
+        const block = document.createElement("div");
+        block.className = "prerefine-preview-block persistent-on-rerun";
+        block.style.cssText = "margin-top:6px";
         const lab = document.createElement("div");
-        lab.style.cssText = "margin-top:6px;font-weight:600;font-size:13px";
+        lab.style.cssText = "font-weight:600;font-size:13px";
         lab.textContent = "다듬기 전 OCR 정보로 합성한 결과 미리보기:";
-        row.result.appendChild(lab);
+        block.appendChild(lab);
         const preview = document.createElement("div");
         preview.style.cssText = "margin-top:4px;display:inline-block;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden";
-        row.result.appendChild(preview);
+        block.appendChild(preview);
         renderLabelsAsDOM(base, inputLines, preview, { maxWidth: "540px" });
+        row.result.appendChild(block);
       }
+      // 다듬기에 사용된 프롬프트 편집 + 재실행
+      addOverlayRefinePromptEditor(row.result, pageNum, base, inputLines,
+        d.base_image_width, d.base_image_height, d.refine_prompt || "");
+      stepInputs.overlay_refine = stepInputs.overlay_refine || {};
+      stepInputs.overlay_refine[pageNum] = {
+        base_image_b64: base,
+        input_lines: inputLines,
+        refine_prompt: d.refine_prompt || "",
+        base_image_width: d.base_image_width,
+        base_image_height: d.base_image_height,
+      };
     } else if (baseStep === "removed_text_overlay") {
       const lines = d.lines || [];
       const base = d.base_image_b64;
@@ -376,6 +420,9 @@ function handlePageStreamEvent(ev) {
         width: d.base_image_width,
         height: d.base_image_height,
       });
+      // 8단계 결과 영역에 편집 가능한 미리보기 + JSON 편집 + 재합성 버튼 추가
+      addEditableOverlayPreview(row.result, pageNum, base, lines,
+        d.base_image_width, d.base_image_height);
     }
     return true;
   }
@@ -623,6 +670,32 @@ function handleStreamEvent(ev) {
         stepInputs.image_gen_text.mask_rects = sd.mask_rects;
       }
     }
+    if (ev.step === "overlay_refine") {
+      const row = stepRows["overlay_refine"];
+      if (row) {
+        row.result.style.display = "block";
+        // 사용 AI 모델 선택 (재실행에 사용)
+        addOverlayRefineModelSelect(row, sd);
+        // API 호출 전에 "다듬기 전 OCR 정보로 합성한 결과 미리보기" 표시
+        const inputLines = sd.input_lines || [];
+        const base = sd.base_image_b64;
+        row.result.querySelectorAll(".prerefine-preview-block").forEach((el) => el.remove());
+        if (base && inputLines.length) {
+          const block = document.createElement("div");
+          block.className = "prerefine-preview-block persistent-on-rerun";
+          block.style.cssText = "margin-top:6px";
+          const lab = document.createElement("div");
+          lab.style.cssText = "font-weight:600;font-size:13px";
+          lab.textContent = "다듬기 전 OCR 정보로 합성한 결과 미리보기:";
+          block.appendChild(lab);
+          const preview = document.createElement("div");
+          preview.style.cssText = "margin-top:4px;display:inline-block;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden";
+          block.appendChild(preview);
+          renderLabelsAsDOM(base, inputLines, preview, { maxWidth: "540px" });
+          row.result.appendChild(block);
+        }
+      }
+    }
     if (ev.step === "image_diff") {
     }
     if (ev.step === "vision_layout") {
@@ -704,6 +777,7 @@ function handleStreamEvent(ev) {
         thumb.style.marginTop = "6px";
         thumb.style.border = "1px solid #e5e7eb";
         thumb.style.borderRadius = "6px";
+        attachImageOpenInNewTab(thumb);
         row.result.appendChild(note);
         row.result.appendChild(thumb);
       }
@@ -780,16 +854,34 @@ function handleStreamEvent(ev) {
         row.result.style.display = "block";
         const inputLines = d.input_lines || [];
         const base = d.base_image_b64;
+        // 다듬기 전 미리보기 블록 (재실행 시 보존)
+        row.result.querySelectorAll(".prerefine-preview-block").forEach((el) => el.remove());
         if (base && inputLines.length) {
+          const block = document.createElement("div");
+          block.className = "prerefine-preview-block persistent-on-rerun";
+          block.style.cssText = "margin-top:6px";
           const lab = document.createElement("div");
-          lab.style.cssText = "margin-top:6px;font-weight:600;font-size:13px";
+          lab.style.cssText = "font-weight:600;font-size:13px";
           lab.textContent = "다듬기 전 OCR 정보로 합성한 결과 미리보기:";
-          row.result.appendChild(lab);
+          block.appendChild(lab);
           const preview = document.createElement("div");
           preview.style.cssText = "margin-top:4px;display:inline-block;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden";
-          row.result.appendChild(preview);
+          block.appendChild(preview);
           renderLabelsAsDOM(base, inputLines, preview, { maxWidth: "540px" });
+          row.result.appendChild(block);
         }
+        // 다듬기에 사용된 프롬프트 편집 + 재실행 (수정 후 7단계 재호출 → 8단계 결과에 반영)
+        addOverlayRefinePromptEditor(row.result, 1, base, inputLines,
+          d.base_image_width, d.base_image_height, d.refine_prompt || "");
+        // 7단계 결과 보존 (8단계 재합성 등에서 사용)
+        stepInputs.overlay_refine = stepInputs.overlay_refine || {};
+        stepInputs.overlay_refine[1] = {
+          base_image_b64: base,
+          input_lines: inputLines,
+          refine_prompt: d.refine_prompt || "",
+          base_image_width: d.base_image_width,
+          base_image_height: d.base_image_height,
+        };
       }
     } else if (ev.step === "removed_text_overlay") {
       const base = d.base_image_b64 || lastImageWithTextB64;
@@ -808,9 +900,9 @@ function handleStreamEvent(ev) {
         row.result.style.display = "block";
         appendStepDetail("removed_text_overlay",
           "합성 라인 수:", String(d.line_count || lines.length || 0));
-        appendStepDetail("removed_text_overlay",
-          "합성에 사용된 글자 정보 (text/좌표/font_size=5단계 OCR, font_color/style=4단계 이미지 픽셀 샘플링, align=left):",
-          JSON.stringify(lines, null, 2));
+        // 8단계 결과 영역에 편집 가능한 미리보기 + JSON 편집 + 재합성 버튼 추가
+        addEditableOverlayPreview(row.result, 1, base, lines,
+          d.base_image_width, d.base_image_height);
         // 8단계 완료 → 다음 페이지 생성 컨트롤을 progressBox 맨 아래에 추가
         maybeAddNextPageControls($("progressBox"));
       }
@@ -984,6 +1076,194 @@ function rerunStep(step) {
   fetch(url, { method: "POST", body: fd })
     .then(consumeStream)
     .catch((err) => appendInfo("재실행 오류: " + err, "error"));
+}
+
+// 7단계 행에 "사용 AI 모델" 콤보박스 추가 (재실행 시 사용). persistent 로 보존.
+function addOverlayRefineModelSelect(row, sd) {
+  if (!row || !row.result) return;
+  if (!Array.isArray(sd.available_options) || !sd.available_options.length) return;
+  // 기존 select 가 있으면 그대로 유지 (사용자 선택 보존)
+  if (row.modelSelect && row.modelSelect.isConnected) return;
+  row.result.querySelectorAll(".overlay-refine-model-block").forEach((el) => el.remove());
+  const wrap = document.createElement("div");
+  wrap.className = "overlay-refine-model-block persistent-on-rerun";
+  wrap.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:6px";
+  const lab = document.createElement("span");
+  lab.style.fontWeight = "600";
+  lab.textContent = "사용 AI 모델:";
+  const sel = document.createElement("select");
+  sel.style.cssText = "padding:4px 8px;font-size:13px;border:1px solid #cbd5e1;border-radius:6px;background:#fff";
+  const curM = String(sd.model || "");
+  const curE = String(sd.reasoning_effort || "");
+  for (const opt of sd.available_options) {
+    if (!opt || typeof opt !== "object") continue;
+    const o = document.createElement("option");
+    o.value = (opt.model || "") + "|" + (opt.reasoning_effort || "");
+    o.textContent = opt.label || (opt.model || "");
+    o.dataset.model = opt.model || "";
+    o.dataset.effort = opt.reasoning_effort || "";
+    if ((opt.model || "") === curM && (opt.reasoning_effort || "") === curE) o.selected = true;
+    sel.appendChild(o);
+  }
+  wrap.appendChild(lab);
+  wrap.appendChild(sel);
+  row.result.appendChild(wrap);
+  row.modelSelect = sel;
+}
+
+
+// 7단계 결과 영역에 다듬기 프롬프트 편집 textarea + 재실행 버튼 추가 (모든 페이지 공통).
+// 수정한 prompt + 현재 input_lines 로 /api/step/overlay_refine 을 다시 호출한다.
+function addOverlayRefinePromptEditor(targetEl, pageNum, base, inputLines, baseWidth, baseHeight, currentPrompt) {
+  if (!targetEl) return;
+  targetEl.querySelectorAll(".overlay-refine-prompt-block").forEach((el) => el.remove());
+
+  const block = document.createElement("div");
+  block.className = "overlay-refine-prompt-block persistent-on-rerun";
+  block.style.cssText = "margin-top:10px";
+
+  const cap = document.createElement("div");
+  cap.style.cssText = "font-weight:600;font-size:13px;margin-bottom:4px";
+  cap.textContent = "API 호출에 사용된 프롬프트 (편집 후 재실행 가능):";
+  block.appendChild(cap);
+
+  const ta = document.createElement("textarea");
+  ta.className = "overlay-refine-prompt-edit";
+  ta.value = currentPrompt || "";
+  ta.style.cssText = "width:100%;max-width:720px;min-height:140px;padding:8px;font-family:monospace;font-size:12px;border:1px solid #cbd5e1;border-radius:6px;background:#0f172a;color:#e2e8f0;resize:vertical";
+  block.appendChild(ta);
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "수정된 프롬프트로 재실행 (7단계 + 8단계 갱신)";
+  btn.style.cssText = "padding:6px 14px;font-size:13px;background:#2563eb;color:#fff;border:0;border-radius:6px;cursor:pointer";
+  btn.addEventListener("click", () => {
+    const editedPrompt = ta.value || "";
+    if (!base) {
+      appendInfo("재실행 불가: base_image 가 없습니다.", "error");
+      return;
+    }
+    const fd = new FormData();
+    fd.append("base_image_b64", base);
+    fd.append("lines_json", JSON.stringify(inputLines || []));
+    fd.append("prompt", editedPrompt);
+    if (baseWidth) fd.append("width", String(baseWidth));
+    if (baseHeight) fd.append("height", String(baseHeight));
+    if (pageNum && pageNum >= 2) {
+      fd.append("step_suffix", "__p" + pageNum);
+      fd.append("page", String(pageNum));
+    }
+    // 선택된 7단계 모델/효율 전달
+    const stepKeyForRow = pageNum >= 2 ? ("overlay_refine__p" + pageNum) : "overlay_refine";
+    const row = stepRows[stepKeyForRow];
+    const sel = row && row.modelSelect;
+    if (sel) {
+      const opt = sel.options[sel.selectedIndex];
+      const chosenModel = (opt && (opt.dataset.model || "")) || "";
+      const chosenEffort = (opt && (opt.dataset.effort || "")) || "";
+      if (chosenModel.trim()) fd.append("model", chosenModel);
+      if (chosenEffort.trim()) fd.append("reasoning_effort", chosenEffort);
+    }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "재실행 중...";
+    fetch("/api/step/overlay_refine", { method: "POST", body: fd })
+      .then(consumeStream)
+      .catch((err) => appendInfo("재실행 오류: " + err, "error"))
+      .finally(() => {
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+  });
+  btnRow.appendChild(btn);
+  block.appendChild(btnRow);
+
+  targetEl.appendChild(block);
+}
+
+
+// 8단계 결과 영역에 편집 가능한 미리보기 + JSON 편집 + 재합성 버튼을 추가 (모든 페이지 공통).
+// - 미리보기 label-edit-box 를 클릭/편집 후 "미리보기로 재합성" → DOM 에서 lines 추출
+// - JSON textarea 를 편집 후 "JSON 으로 재합성" → JSON 파싱 → lines 적용
+// 두 경우 모두 미리보기, 오른쪽 오버레이 히스토리, JSON textarea 가 동기 갱신된다.
+function addEditableOverlayPreview(targetEl, pageNum, base, initialLines, baseWidth, baseHeight) {
+  if (!targetEl || !base) return;
+  targetEl.querySelectorAll(".overlay-edit-block").forEach((el) => el.remove());
+
+  const block = document.createElement("div");
+  block.className = "overlay-edit-block";
+  block.style.cssText = "margin-top:10px";
+
+  const cap = document.createElement("div");
+  cap.style.cssText = "font-weight:600;font-size:13px;margin-bottom:4px";
+  cap.textContent = "합성 결과 (글자 클릭 후 편집 가능):";
+  block.appendChild(cap);
+
+  const preview = document.createElement("div");
+  preview.className = "overlay-edit-preview";
+  preview.style.cssText = "display:inline-block;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden";
+  block.appendChild(preview);
+
+  let currentLines = Array.isArray(initialLines) ? initialLines.slice() : [];
+  renderLabelsAsDOM(base, currentLines, preview, { maxWidth: "540px" });
+
+  // 합성 글자 정보 JSON 편집 영역
+  const jsonCap = document.createElement("div");
+  jsonCap.style.cssText = "font-weight:600;font-size:13px;margin:10px 0 4px";
+  jsonCap.textContent = "합성에 사용된 글자 정보 (JSON 직접 편집 가능):";
+  block.appendChild(jsonCap);
+
+  const jsonTa = document.createElement("textarea");
+  jsonTa.className = "overlay-edit-json";
+  jsonTa.value = JSON.stringify(currentLines, null, 2);
+  jsonTa.style.cssText = "width:100%;max-width:720px;min-height:200px;padding:8px;font-family:monospace;font-size:12px;border:1px solid #cbd5e1;border-radius:6px;background:#0f172a;color:#e2e8f0;resize:vertical";
+  block.appendChild(jsonTa);
+
+  function syncAll(updated, natW, natH) {
+    currentLines = updated;
+    // 위 미리보기는 다시 그리지 않고, 오른쪽 오버레이 히스토리(최종 결과물) 만 다시 그림
+    jsonTa.value = JSON.stringify(updated, null, 2);
+    addOverlayHistoryEntry(pageNum, base, updated, { width: natW, height: natH });
+    if (pageNum === 1 && stepInputs.removed_text_overlay) {
+      stepInputs.removed_text_overlay = {
+        base_image_b64: base,
+        lines: updated,
+      };
+    }
+  }
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+
+  // JSON 수정 → 재합성
+  const jsonBtn = document.createElement("button");
+  jsonBtn.type = "button";
+  jsonBtn.textContent = "위 글자 정보로 합성";
+  jsonBtn.style.cssText = "padding:6px 14px;font-size:13px;background:#0ea5e9;color:#fff;border:0;border-radius:6px;cursor:pointer";
+  jsonBtn.addEventListener("click", () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonTa.value || "[]");
+    } catch (e) {
+      appendInfo("JSON 파싱 오류: " + e.message, "error");
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      appendInfo("JSON 은 배열이어야 합니다.", "error");
+      return;
+    }
+    const natW = baseWidth || 0;
+    const natH = baseHeight || 0;
+    syncAll(parsed, natW, natH);
+    appendInfo("페이지 " + pageNum + ": 수정된 글자 정보로 재합성했습니다.", "done");
+  });
+  btnRow.appendChild(jsonBtn);
+
+  block.appendChild(btnRow);
+  targetEl.appendChild(block);
 }
 
 function regenOverlayFromDom() {
@@ -1203,17 +1483,63 @@ function getOrCreatePageContainer(pageNum) {
   return container;
 }
 
+// 이미지 클릭 시 새 탭에 Blob URL 로 표시 (큰 data URL 도 정상 동작)
+function attachImageOpenInNewTab(img) {
+  if (!img) return;
+  img.style.cursor = "zoom-in";
+  img.addEventListener("click", () => {
+    fetch(img.src)
+      .then((r) => r.blob())
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const w = window.open(url, "_blank");
+        if (!w) {
+          const a = document.createElement("a");
+          a.href = url;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.click();
+        }
+      })
+      .catch(() => window.open(img.src, "_blank"));
+  });
+}
+
+const STEP_NUM_MAP = {
+  ocr: 1, gpt: 2, image_gen: 3, image_gen2: 4,
+  image_gen_ocr: 5, image_gen_text: 6, overlay_refine: 7,
+  removed_text_overlay: 8,
+};
+
+function formatStepLabel(step, label) {
+  const m = String(step || "").match(/^(.+?)__p(\d+)$/);
+  const baseStep = m ? m[1] : (step || "");
+  const pageNum = m ? Number(m[2]) : 1;
+  const stepNum = STEP_NUM_MAP[baseStep];
+  // 백엔드 label 에서 기존 "페이지 N · M단계 — " prefix 가 있으면 제거하고 통일된 형식으로 다시 구성
+  let desc = String(label || baseStep);
+  desc = desc.replace(/^페이지\s*\d+\s*·\s*\d+단계\s*[—\-]\s*/, "");
+  if (stepNum) {
+    return `페이지 ${pageNum} · ${stepNum}단계 — ${desc}`;
+  }
+  return desc;
+}
+
 function startStep(step, label, elapsed) {
+  const formattedLabel = formatStepLabel(step, label);
   if (stepRows[step]) {
     const row = stepRows[step];
     row.line.className = "progress-line running";
     row.line.querySelector(".badge").textContent = "실행중";
     row.line.querySelector(".dur").textContent = "";
-    row.line.querySelector("b").textContent = label || step;
+    row.line.querySelector("b").textContent = formattedLabel;
     const btn = row.line.querySelector(".rerun-btn");
     if (btn) btn.style.display = "none";
+    // persistent-on-rerun 클래스 요소는 보존하고 나머지만 제거
+    const persistent = Array.from(row.result.querySelectorAll(".persistent-on-rerun"));
     row.result.innerHTML = "";
-    row.result.style.display = "none";
+    persistent.forEach((el) => row.result.appendChild(el));
+    row.result.style.display = persistent.length > 0 ? "block" : "none";
     return;
   }
   stepCounter += 1;
@@ -1221,7 +1547,6 @@ function startStep(step, label, elapsed) {
   line.className = "progress-line running";
   const isOverlay = step === "removed_text_overlay";
   line.innerHTML =
-    '<span class="step-num"></span>' +
     '<span class="badge">실행중</span>' +
     '<b></b>' +
     '<span class="dur"></span>' +
@@ -1233,8 +1558,7 @@ function startStep(step, label, elapsed) {
         'font-size:11px;border:0;background:#2563eb;color:#fff;' +
         'border-radius:6px;cursor:pointer">재생성</button>'
       : '');
-  line.querySelector(".step-num").textContent = stepCounter + ".";
-  line.querySelector("b").textContent = label || step;
+  line.querySelector("b").textContent = formattedLabel;
   const rerunBtn = line.querySelector(".rerun-btn");
   rerunBtn.addEventListener("click", () => rerunStep(step));
   if (isOverlay) {

@@ -259,17 +259,10 @@ IMAGE_GEN_TEXT_OPTIONS: list[dict[str, str]] = [
     {"model": GEMINI_IMAGE_MODEL, "quality": "",       "label": GEMINI_IMAGE_MODEL},
 ]
 
-# 7단계 (overlay_refine) 모델 선택지. gpt-5 의 reasoning_effort 단계별 옵션.
-_OVERLAY_REFINE_MODEL = OPENAI_VISION_MODEL
+# 7단계 (overlay_refine) 모델 선택지 (gpt-5.1, gpt-5.5).
 OVERLAY_REFINE_OPTIONS: list[dict[str, str]] = [
-    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "minimal",
-     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: minimal — 가장 빠름)"},
-    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "low",
-     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: low)"},
-    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "medium",
-     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: medium — 기본)"},
-    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "high",
-     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: high — 정밀, 느림)"},
+    {"model": "gpt-5.1", "reasoning_effort": "high", "label": "gpt-5.1"},
+    {"model": "gpt-5.5", "reasoning_effort": "high", "label": "gpt-5.5"},
 ]
 #OVERLAY_REFINE_DEFAULT_EFFORT = "medium"
 OVERLAY_REFINE_DEFAULT_EFFORT = "high"
@@ -1193,17 +1186,25 @@ STEP6_TEXT_REMOVE_PROMPT = (
 
 OVERLAY_REFINE_PROMPT_HEAD = (
     "이 이미지에 아래 문구를 넣으려고 해. 위치와 색을 확인해 보고 "
-    "더 적합하도록 아래 정보를 수정해 봐.\n"
+    "더 적합하도록 아래 JSON 정보를 수정해 봐.\n"
+    "좌표는 이미지 좌상단을 (0, 0) 으로 두고,\n"
+    "x는 오른쪽으로, y는 아래쪽으로 증가하는 정수 픽셀 좌표계를 사용해.\n"
+    "각 라인의 x, y는 라인 박스의 좌상단 모서리야.\n"
+    "width/height는 박스의 가로·세로 길이야.\n"
+    "라인의 우하단 모서리는 (x+width, y+height)야.\n"
+    "중요 규칙:\n"
+    "- 출력은 JSON 객체 하나로만 해. 형식: {\"lines\": [...]}.\n"
+    "- 형식은 반드시 {{\"lines\": [...]}} 로 유지해.\n"
+    "- lines 배열의 각 항목은 입력과 동일한 키를 유지해 "
+    "- x, y, width, height는 모두 정수 픽셀로 반환해.\n"
+    "- 모든 라인은 이미지 안에 있어야 해.\n"
+    "- 기존 위치가 크게 틀리지 않으면 ±50px 이내에서만 보정해.\n"
+    "- font_color는 배경 대비가 좋게 조정하되, 제품 톤과 어울리는 색을 우선 사용해.\n"
+    "- x, y, width, height 는 정수 픽셀, font_color 는 '#RRGGBB', "
+    "- style 은 'bold' 또는 'normal', align 은 'left' | 'center' | 'right' 중 하나. "
+    "수정 전 JSON:\n"
 )
-OVERLAY_REFINE_OUTPUT_GUIDE = (
-    "\n\n"
-    "출력은 JSON 객체 하나로만 해. 형식: {\"lines\": [...]}.\n"
-    "lines 배열의 각 항목은 입력과 동일한 키를 유지해 "
-    "(text, x, y, width, height, font_size, font_color, style, align). "
-    "x, y, width, height 는 정수 픽셀, font_color 는 '#RRGGBB', "
-    "style 은 'bold' 또는 'normal', align 은 'left' | 'center' | 'right' 중 하나. "
-    "라인 개수와 순서는 입력과 동일하게 유지해."
-)
+OVERLAY_REFINE_OUTPUT_GUIDE = ""
 OVERLAY_REFINE_SYSTEM_INSTRUCTION = (
     "You output only one valid JSON object. "
     "No markdown fences, no natural language before or after the JSON."
@@ -1218,38 +1219,52 @@ def _refine_overlay_layout_sync(
     image_width: int | None = None,
     image_height: int | None = None,
     reasoning_effort: str | None = None,
+    prompt_override: str | None = None,
 ) -> tuple[list[dict[str, Any]], str, str]:
     """글자 제거 이미지 + 현재 합성 정보를 GPT 비전에 보내 다듬어진 lines 반환.
 
-    image_width / image_height 를 받아 프롬프트에 좌표계 grounding 을 명시한다.
+    prompt_override 가 주어지면 자동 생성 대신 그 텍스트를 user message 로 사용한다.
 
     Returns: (refined_lines, vision_prompt, raw_response)
     실패 시 원본 lines 그대로 반환 (raw 는 빈 문자열).
     """
-    grounding = ""
-    if image_width and image_height:
-        grounding = f"""
-이미지 크기는 {image_width}×{image_height} px 이야.
-좌표는 이미지 좌상단을 (0, 0) 으로 두고,
-x는 오른쪽으로, y는 아래쪽으로 증가하는 정수 픽셀 좌표계를 사용해.
-각 라인의 x, y는 라인 박스의 좌상단 모서리야.
-width/height는 박스의 가로·세로 길이야.
-라인의 우하단 모서리는 (x+width, y+height)야.
-중요 규칙:
-- 출력은 JSON 객체 하나만 반환해.
-- 형식은 반드시 {{"lines": [...]}} 로 유지해.
-- lines 배열의 라인 개수와 순서는 입력과 동일하게 유지해.
-- x, y, width, height는 모두 정수 픽셀로 반환해.
-- 모든 라인은 이미지 안에 있어야 해.
-- 기존 위치가 크게 틀리지 않으면 ±50px 이내에서만 보정해.
-- 특별한 이유가 없으면 모든 문구의 align은 "left"로 해.
-- font_color는 배경 대비가 좋게 조정하되, 제품 톤과 어울리는 색을 우선 사용해.
-수정 전 JSON:
-        """
+    if prompt_override is not None and prompt_override.strip():
+        user_text = prompt_override
+        data_uri = f"data:image/png;base64,{image_b64_png}"
+        client = OpenAI(api_key=api_key)
+        input_messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": user_text},
+                    {"type": "input_image", "image_url": data_uri},
+                ],
+            },
+        ]
+        kwargs: dict[str, Any] = {
+            "model": vision_model,
+            "input": input_messages,
+            "text": {"format": {"type": "json_object"}},
+        }
+        if reasoning_effort:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+        try:
+            response = client.responses.create(**kwargs)
+            raw_text = response.output_text or ""
+        except Exception as ex:
+            print(f"[overlay_refine] prompt_override 실행 실패: {ex}")
+            return current_lines, user_text, ""
+        try:
+            parsed = json.loads(raw_text)
+            refined = parsed.get("lines", current_lines)
+            if not isinstance(refined, list):
+                refined = current_lines
+        except Exception:
+            refined = current_lines
+        return refined, user_text, raw_text
         
     user_text = (
         OVERLAY_REFINE_PROMPT_HEAD
-        + grounding
         + json.dumps(current_lines, ensure_ascii=False, indent=2)
         + OVERLAY_REFINE_OUTPUT_GUIDE
     )
@@ -2570,6 +2585,9 @@ async def _generate_stream(
                 "available_options": OVERLAY_REFINE_OPTIONS,
                 "input_line_count": len(overlay_labels),
                 "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
             },
         })
         t0 = time.perf_counter()
@@ -3317,6 +3335,7 @@ async def api_step_overlay_refine(request: Request) -> StreamingResponse:
     base_image_b64 = str(form.get("base_image_b64") or "")
     lines_json = str(form.get("lines_json") or "[]")
     step_suffix = str(form.get("step_suffix") or "")
+    prompt_override = str(form.get("prompt") or "").strip()
     chosen_model = (str(form.get("model") or "").strip()
                     or OPENAI_VISION_MODEL)
     chosen_effort = (str(form.get("reasoning_effort") or "").strip()
@@ -3365,6 +3384,9 @@ async def api_step_overlay_refine(request: Request) -> StreamingResponse:
                 "available_options": OVERLAY_REFINE_OPTIONS,
                 "input_line_count": len(lines),
                 "input_lines": lines,
+                "base_image_b64": base_image_b64,
+                "base_image_width": width,
+                "base_image_height": height,
             },
             **({"page": page_num} if page_num else {}),
         })
@@ -3373,7 +3395,7 @@ async def api_step_overlay_refine(request: Request) -> StreamingResponse:
             refined, prompt, raw = await asyncio.to_thread(
                 _refine_overlay_layout_sync,
                 api_key, chosen_model, base_image_b64, lines, width, height,
-                chosen_effort,
+                chosen_effort, prompt_override or None,
             )
         except Exception as ex:
             total = round(time.perf_counter() - t_start, 2)
@@ -3749,6 +3771,9 @@ async def api_next_page(request: Request) -> StreamingResponse:
                 "available_options": OVERLAY_REFINE_OPTIONS,
                 "input_line_count": len(overlay_labels),
                 "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
             },
         })
         t0 = time.perf_counter()

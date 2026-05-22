@@ -22,7 +22,7 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5")
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
 # 이미지 위 문구 좌표 추출 (멀티모달)
-OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.1")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5.5")
 
 # Gemini (텍스트 → JSON 단계에서 사용)
 GEMINI_API_KEY = os.getenv(
