@@ -14,17 +14,24 @@ import os
 import re
 import tempfile
 import time
+import uuid
+from contextvars import ContextVar
 from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+import numpy as np
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types as genai_types
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
+
+from text_mask_refiner import inpaint_with_mask, refine_mask_to_text_pixels
 
 from config import (
     GEMINI_API_KEY,
@@ -44,7 +51,15 @@ from ocr_util import ocr_image_file
 
 app = FastAPI(title="제품 상세 프롬프트 생성", version="1.0.0")
 
-_ASSETS = Path(__file__).resolve().parent / "assets"
+_BASE_DIR = Path(__file__).resolve().parent
+_STATIC_DIR = _BASE_DIR / "static"
+_TEMPLATES_DIR = _BASE_DIR / "templates"
+_INDEX_HTML_PATH = _TEMPLATES_DIR / "index.html"
+
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+_ASSETS = _BASE_DIR / "assets"
 _PROMPT_HEAD = _ASSETS / "prompt_head.txt"
 _PROMPT_TAIL = _ASSETS / "prompt_tail.txt"
 
@@ -75,29 +90,50 @@ def _openai_api_key() -> str:
 
 
 def _parse_gpt_json(raw: str) -> tuple[str, dict[str, Any] | None]:
-    """모델 응답에서 JSON 객체 1개를 파싱. 실패 시 (raw, None)."""
+    """모델 응답에서 JSON 객체 1개를 파싱. 실패 시 (raw, None).
+
+    Gemini/OpenAI 가 본문 앞뒤에 코드펜스, 설명문, 또는 우발적인 추가 토큰
+    (예: 빈 줄 + 단독 `}`) 을 붙여 보내도 첫 번째 완결된 객체를 추출한다.
+    """
     text = (raw or "").strip()
     if not text:
         return text, None
     try:
-        return text, json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return text, parsed
     except json.JSONDecodeError:
         pass
-    # ```json ... ``` 또는 본문 중 첫 { ... } 블록 시도
+    # ```json ... ``` 코드펜스 안쪽 우선
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
     if fence:
         inner = fence.group(1).strip()
-        try:
-            return text, json.loads(inner)
-        except json.JSONDecodeError:
-            pass
-    brace = re.search(r"\{[\s\S]*\}", text)
-    if brace:
-        try:
-            return text, json.loads(brace.group(0))
-        except json.JSONDecodeError:
-            pass
+        parsed = _raw_decode_first_object(inner)
+        if isinstance(parsed, dict):
+            return text, parsed
+    # 본문 어디서든 첫 '{' 부터 raw_decode 로 잘라 시도 (trailing garbage 허용)
+    parsed = _raw_decode_first_object(text)
+    if isinstance(parsed, dict):
+        return text, parsed
     return text, None
+
+
+def _raw_decode_first_object(text: str) -> Any:
+    """text 의 첫 '{' 위치부터 JSONDecoder.raw_decode 로 한 객체만 파싱.
+
+    뒤따르는 추가 문자(빈 줄, 잉여 `}` 등) 는 무시된다. 실패하면 None 반환.
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        obj, _end = decoder.raw_decode(text[start:])
+        return obj
+    except json.JSONDecodeError:
+        return None
 
 
 _GEMINI_CLIENT: genai.Client | None = None
@@ -207,13 +243,36 @@ IMAGE_TEXT_CLEAN_PROMPT = (
 "이미지에서 OCR 로 추출한 텍스트 영역만 지울지 검토할 영역이고 나머지 영역은 절대 수정하지 마.\n"
 )
 
-# 4단계 (image_gen_text) 에서 선택 가능한 이미지 모델 + 품질 조합 (첫 항목이 기본값)
+# 4단계 (image_gen2) 에서 선택 가능한 이미지 모델 + 품질 조합 (첫 항목이 기본값)
+IMAGE_GEN2_OPTIONS: list[dict[str, str]] = [
+    {"model": OPENAI_IMAGE_MODEL, "quality": "low",    "label": f"{OPENAI_IMAGE_MODEL} (low)"},
+    {"model": OPENAI_IMAGE_MODEL, "quality": "medium", "label": f"{OPENAI_IMAGE_MODEL} (medium)"},
+    {"model": OPENAI_IMAGE_MODEL, "quality": "high",   "label": f"{OPENAI_IMAGE_MODEL} (high)"},
+    {"model": GEMINI_IMAGE_MODEL, "quality": "",       "label": GEMINI_IMAGE_MODEL},
+]
+
+# 6단계 (image_gen_text) 에서 선택 가능한 이미지 모델 + 품질 조합 (첫 항목이 기본값)
 IMAGE_GEN_TEXT_OPTIONS: list[dict[str, str]] = [
     {"model": OPENAI_IMAGE_MODEL, "quality": "low",    "label": f"{OPENAI_IMAGE_MODEL} (low)"},
     {"model": OPENAI_IMAGE_MODEL, "quality": "medium", "label": f"{OPENAI_IMAGE_MODEL} (medium)"},
     {"model": OPENAI_IMAGE_MODEL, "quality": "high",   "label": f"{OPENAI_IMAGE_MODEL} (high)"},
     {"model": GEMINI_IMAGE_MODEL, "quality": "",       "label": GEMINI_IMAGE_MODEL},
 ]
+
+# 7단계 (overlay_refine) 모델 선택지. gpt-5 의 reasoning_effort 단계별 옵션.
+_OVERLAY_REFINE_MODEL = OPENAI_VISION_MODEL
+OVERLAY_REFINE_OPTIONS: list[dict[str, str]] = [
+    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "minimal",
+     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: minimal — 가장 빠름)"},
+    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "low",
+     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: low)"},
+    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "medium",
+     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: medium — 기본)"},
+    {"model": _OVERLAY_REFINE_MODEL, "reasoning_effort": "high",
+     "label": f"{_OVERLAY_REFINE_MODEL} (reasoning: high — 정밀, 느림)"},
+]
+#OVERLAY_REFINE_DEFAULT_EFFORT = "medium"
+OVERLAY_REFINE_DEFAULT_EFFORT = "high"
 
 
 def build_image_text_prompt(first: dict[str, Any]) -> str:
@@ -312,9 +371,6 @@ def _ocr_with_positions_sync(image_bytes: bytes) -> dict[str, Any]:
                 "width": int(round(w_box)),
                 "height": int(round(h_box)),
                 "font_size": int(round(h_box * 0.85)),
-                "align": "left",
-                "font_color": "#111111",
-                "style": "bold",
             })
     return {
         "lines": lines_out,
@@ -536,6 +592,374 @@ def _gemini_image_edit_sync(
     )
 
 
+def _build_text_mask_png(
+    width: int, height: int, rects: list[dict[str, Any]], pad: int = 4
+) -> bytes:
+    """텍스트 영역만 투명(alpha=0), 나머지는 불투명(alpha=255) 인 RGBA PNG 마스크.
+
+    OpenAI images.edit 의 mask 규약: 투명한 영역만 모델이 재생성/편집한다.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"마스크 크기가 잘못됨: {width}x{height}")
+    mask = Image.new("RGBA", (width, height), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(mask)
+    for r in rects or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            x = int(r.get("x") or 0)
+            y = int(r.get("y") or 0)
+            w = int(r.get("width") or 0)
+            h = int(r.get("height") or 0)
+        except (ValueError, TypeError):
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(width, x + w + pad)
+        y1 = min(height, y + h + pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0, 0))
+    bio = BytesIO()
+    mask.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _composite_mask_regions(
+    base_png: bytes, edited_png: bytes,
+    rects: list[dict[str, Any]], pad: int = 4,
+    mask_png_override: bytes | None = None,
+) -> bytes:
+    """edited_png 의 마스크 영역만 base_png 위에 덮어쓴 PNG 반환.
+
+    mask_png_override 가 주어지면 그 마스크의 alpha=0 영역을 합성 영역으로 쓴다
+    (API 에 실제 보낸 마스크와 합성을 일치). 없으면 rects+pad 로 박스를 만든다.
+    """
+    base = Image.open(BytesIO(base_png)).convert("RGBA")
+    edited = Image.open(BytesIO(edited_png)).convert("RGBA")
+    if edited.size != base.size:
+        edited = edited.resize(base.size, Image.LANCZOS)
+    if mask_png_override:
+        mp = Image.open(BytesIO(mask_png_override)).convert("RGBA")
+        if mp.size != base.size:
+            mp = mp.resize(base.size, Image.NEAREST)
+        # mask 의 alpha=0 (재생성 영역) → composite mask=255 (edited 사용)
+        import numpy as _np
+        alpha = _np.array(mp.split()[-1])
+        comp_arr = (255 - alpha).astype("uint8")
+        region_mask = Image.fromarray(comp_arr, mode="L")
+    else:
+        region_mask = Image.new("L", base.size, 0)
+        draw = ImageDraw.Draw(region_mask)
+        bw, bh = base.size
+        for r in rects or []:
+            if not isinstance(r, dict):
+                continue
+            try:
+                x = int(r.get("x") or 0)
+                y = int(r.get("y") or 0)
+                w = int(r.get("width") or 0)
+                h = int(r.get("height") or 0)
+            except (ValueError, TypeError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(bw, x + w + pad)
+            y1 = min(bh, y + h + pad)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            draw.rectangle([x0, y0, x1, y1], fill=255)
+    out = base.copy()
+    out.paste(edited, (0, 0), region_mask)
+    bio = BytesIO()
+    out.convert("RGB").save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _expand_rects_with_margin(
+    rects: list[dict[str, Any]], margin: int, img_width: int | None = None, img_height: int | None = None
+) -> list[dict[str, Any]]:
+    """각 rect 를 margin 픽셀씩 확장."""
+    expanded = []
+    for r in rects:
+        if not isinstance(r, dict):
+            expanded.append(r)
+            continue
+        try:
+            x = int(r.get("x", 0))
+            y = int(r.get("y", 0))
+            w = int(r.get("width", 0))
+            h = int(r.get("height", 0))
+        except (ValueError, TypeError):
+            expanded.append(r)
+            continue
+
+        x_new = max(0, x - margin)
+        y_new = max(0, y - margin)
+        x_end = x + w + margin
+        y_end = y + h + margin
+
+        # 이미지 크기 제한 (선택적)
+        if img_width is not None:
+            x_end = min(img_width, x_end)
+        if img_height is not None:
+            y_end = min(img_height, y_end)
+
+        w_new = x_end - x_new
+        h_new = y_end - y_new
+
+        # 확장 후 크기가 유효한 경우만 포함
+        if w_new > 0 and h_new > 0:
+            expanded_r = {**r, "x": x_new, "y": y_new, "width": w_new, "height": h_new}
+            expanded.append(expanded_r)
+    return expanded
+
+
+def _mask_alpha_bbox(mask_png: bytes) -> tuple[int, int, int, int] | None:
+    """RGBA 마스크의 alpha<255 영역(재생성 대상) 의 (x, y, w, h) bbox 반환.
+
+    투명 영역이 없으면 None.
+    """
+    img = Image.open(BytesIO(mask_png)).convert("RGBA")
+    alpha = img.split()[-1]
+    # alpha<255 → 255, 그 외 → 0 (재생성 영역을 흰색으로 표현)
+    inv = alpha.point(lambda v: 0 if v == 255 else 255)
+    bbox = inv.getbbox()
+    if bbox is None:
+        return None
+    x0, y0, x1, y1 = bbox
+    return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+
+
+def _crop_png(png: bytes, bbox: tuple[int, int, int, int]) -> bytes:
+    x, y, w, h = bbox
+    img = Image.open(BytesIO(png))
+    crop = img.crop((x, y, x + w, y + h))
+    bio = BytesIO()
+    crop.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _paste_resized(
+    base_png: bytes, patch_png: bytes, bbox: tuple[int, int, int, int]
+) -> bytes:
+    """patch_png 를 bbox 크기로 리사이즈해 base_png 의 (bbox.x, bbox.y) 에 붙여 PNG 반환."""
+    x, y, w, h = bbox
+    base = Image.open(BytesIO(base_png)).convert("RGB")
+    patch = Image.open(BytesIO(patch_png)).convert("RGB")
+    if patch.size != (w, h):
+        patch = patch.resize((w, h), Image.LANCZOS)
+    base.paste(patch, (x, y))
+    bio = BytesIO()
+    base.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _apply_alpha_outside_mask(rgb_png: bytes, mask_png: bytes, margin: int = 20) -> bytes:
+    """rgb_png 에 마스크의 각 영역(alpha=0) 을 margin 픽셀씩 확장한 영역만 원본 유지, 그 외는 흰색.
+
+    margin: 각 마스크 영역을 margin 픽셀씩 dilate (기본 20px).
+    """
+    rgb = Image.open(BytesIO(rgb_png)).convert("RGBA")
+    mask = Image.open(BytesIO(mask_png)).convert("RGBA")
+    if mask.size != rgb.size:
+        mask = mask.resize(rgb.size, Image.NEAREST)
+
+    mask_alpha = mask.split()[-1]
+    # mask alpha=0 (마스크 영역) 을 margin 픽셀씩 dilate
+    # MinFilter: 각 픽셀을 주변 최소값으로 대체 → alpha=0 영역(=마스크 영역) 이 확장됨
+    if margin > 0:
+        size = margin * 2 + 1
+        mask_alpha = mask_alpha.filter(ImageFilter.MinFilter(size))
+    # 확장된 마스크 영역 → inside=255 (원본 유지), 그 외 → inside=0 (흰색 덮어씀)
+    inside_mask = mask_alpha.point(lambda v: 255 if v == 0 else 0)
+
+    # 마스크 영역 외 (inside_arr == 0) 를 흰색으로 덮어씀
+    rgba_arr = np.array(rgb)
+    inside_arr = np.asarray(inside_mask)
+    rgba_arr[inside_arr == 0, 0] = 255
+    rgba_arr[inside_arr == 0, 1] = 255
+    rgba_arr[inside_arr == 0, 2] = 255
+    rgba_arr[inside_arr == 0, 3] = 255
+
+    rgba = Image.fromarray(rgba_arr, mode="RGBA")
+    # RGB 로 저장하여 alpha 채널 제거
+    rgb_final = rgba.convert("RGB")
+    bio = BytesIO()
+    rgb_final.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def _crop_paste_api_call(
+    api_key: str, prompt: str,
+    api_input_bytes: bytes, mask_png_bytes: bytes,
+    model: str, quality: str,
+) -> dict[str, Any]:
+    """mask 영역 외 부분은 투명하게 만들어 API 호출 → 응답의 mask 영역만 원본에 붙여 반환.
+
+    반환 dict 키:
+      - bbox: (x, y, w, h) | None  (None 이면 마스크에 투명 영역 없음 → 폴백)
+      - cropped_input_bytes: bytes | None  (마스크 외 투명 처리된 입력 — API 에 보낸 이미지)
+      - cropped_mask_bytes: bytes | None   (= mask_png_bytes)
+      - api_response_bytes: bytes | None   (API 가 반환한 원시 이미지)
+      - final_bytes: bytes                 (최종 합성 이미지 — 항상 존재)
+      - final_width / final_height: int
+    """
+    bbox = _mask_alpha_bbox(mask_png_bytes) if mask_png_bytes else None
+    if bbox is None:
+        # 폴백: 전체 이미지 + 마스크 없음으로 호출
+        out = _images_generate_sync(
+            api_key, prompt, choose_api_size(*Image.open(BytesIO(api_input_bytes)).size),
+            api_input_bytes, "step3_inpainted.png",
+            model, quality, None, mask_png_bytes,
+        )
+        raw = base64.b64decode(out["b64_json"])
+        with Image.open(BytesIO(raw)) as g:
+            gw, gh = g.size
+        return {
+            "bbox": None,
+            "cropped_input_bytes": None,
+            "cropped_mask_bytes": None,
+            "api_response_bytes": raw,
+            "final_bytes": raw,
+            "final_width": gw, "final_height": gh,
+        }
+
+    in_w, in_h = Image.open(BytesIO(api_input_bytes)).size
+    # mask 를 api_input 과 같은 크기로 crop/paste (resize 하지 않음)
+    mask_img = Image.open(BytesIO(mask_png_bytes)).convert("RGBA")
+    if mask_img.size != (in_w, in_h):
+        canvas = Image.new("RGBA", (in_w, in_h), (0, 0, 0, 0))
+        canvas.paste(mask_img, (0, 0))
+        _bio = BytesIO()
+        canvas.save(_bio, format="PNG")
+        mask_full = _bio.getvalue()
+    else:
+        mask_full = mask_png_bytes
+
+    # API 호출: 1번 원본 이미지 + 2번 마스크를 전달
+    size = choose_api_size(in_w, in_h)
+    out = _images_generate_sync(
+        api_key, prompt, size,
+        api_input_bytes, "step3_inpainted.png",
+        model, quality, None, mask_full,
+    )
+    raw = base64.b64decode(out["b64_json"])
+
+    # mask 영역만 원본 api_input_bytes 에 합성 (픽셀 단위)
+    final_bytes = _composite_mask_regions(
+        api_input_bytes, raw, [], 4, mask_full,
+    )
+    with Image.open(BytesIO(final_bytes)) as g:
+        fw, fh = g.size
+    return {
+        "bbox": bbox,
+        "cropped_input_bytes": api_input_bytes,
+        "cropped_mask_bytes": mask_full,
+        "api_response_bytes": raw,
+        "final_bytes": final_bytes,
+        "final_width": fw, "final_height": fh,
+    }
+
+
+def _inpaint_and_save(
+    base_image_bytes: bytes, refined_mask_png: bytes,
+    label: str, page: int | None = None,
+) -> tuple[bytes, str | None]:
+    """refined mask 의 alpha=0 영역을 주변 색으로 메꾼 PNG 를 만들고 세션 디렉토리에 저장.
+
+    반환: (inpainted_png_bytes, relative_file_path)
+    실패 시 (base_image_bytes, None) 으로 폴백.
+    """
+    try:
+        inpainted = inpaint_with_mask(base_image_bytes, refined_mask_png)
+    except Exception as ex:
+        print(f"[{label}] 인페인트 실패, 원본 4단계 이미지 그대로 사용: {ex}")
+        return base_image_bytes, None
+    try:
+        sdir = _session_dir_var.get()
+        if sdir is None:
+            sdir = _LOG_ROOT / "ad_hoc"
+            sdir.mkdir(parents=True, exist_ok=True)
+            page_dir = sdir
+        else:
+            page_label = "common" if page is None else f"page_{page}"
+            page_dir = sdir / page_label
+            page_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:4]
+        fname = f"{_safe_name(label)}__inpainted_{stamp}.png"
+        out_path = page_dir / fname
+        out_path.write_bytes(inpainted)
+        try:
+            rel = str(out_path.relative_to(_LOG_ROOT))
+        except ValueError:
+            rel = str(out_path)
+        return inpainted, rel
+    except Exception as ex:
+        print(f"[{label}] 인페인트 결과 저장 실패: {ex}")
+        return inpainted, None
+
+
+def _refine_mask_with_logging(
+    coarse_png: bytes, base_image_bytes: bytes,
+    label: str, page: int | None = None,
+) -> tuple[bytes, str | None, dict[str, Any]]:
+    """거친 마스크를 글자 픽셀만 남긴 세부 마스크로 정교화하고 파일로 저장.
+
+    반환: (refined_png_bytes, refined_file_relpath, info_dict)
+    실패 시 (coarse_png, None, {"error": ...}) 로 폴백.
+    """
+    try:
+        refined_png, info = refine_mask_to_text_pixels(base_image_bytes, coarse_png)
+    except Exception as ex:
+        print(f"[{label}] 마스크 정교화 실패, 거친 마스크 그대로 사용: {ex}")
+        return coarse_png, None, {"error": str(ex)}
+    refined_path = _save_mask_to_session(
+        refined_png, label=f"{label}_refined", page=page,
+    )
+    return refined_png, refined_path, info
+
+
+def _save_mask_to_session(
+    mask_bytes: bytes, label: str = "image_gen_text",
+    page: int | None = None,
+) -> str | None:
+    """현재 요청의 세션 로그 디렉토리에 마스크 PNG 를 저장하고 상대 경로 반환.
+
+    세션 디렉토리가 없으면 logs/ad_hoc/ 에 timestamp 파일명으로 저장.
+    저장 실패 시 None 반환.
+    """
+    if not mask_bytes:
+        return None
+    try:
+        sdir = _session_dir_var.get()
+        if sdir is None:
+            sdir = _LOG_ROOT / "ad_hoc"
+            sdir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
+            page_dir = sdir
+            fname = f"{_safe_name(label)}__mask__{stamp}.png"
+        else:
+            page_label = "common" if page is None else f"page_{page}"
+            page_dir = sdir / page_label
+            page_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:4]
+            fname = f"{_safe_name(label)}__mask_{stamp}.png"
+        out_path = page_dir / fname
+        out_path.write_bytes(mask_bytes)
+        try:
+            return str(out_path.relative_to(_LOG_ROOT))
+        except ValueError:
+            return str(out_path)
+    except Exception as ex:
+        print(f"[mask save] 실패: {ex}")
+        return None
+
+
 def _images_generate_sync(
     api_key: str,
     prompt: str,
@@ -545,6 +969,7 @@ def _images_generate_sync(
     model: str | None = None,
     quality: str | None = None,
     extra_images: list[tuple[bytes, str]] | None = None,
+    mask: bytes | None = None,
 ) -> dict[str, Any]:
     """첫 image2_prompt_en 으로 이미지 생성.
 
@@ -588,6 +1013,10 @@ def _images_generate_sync(
             "size": size,
             "quality": use_quality,
         }
+        if mask:
+            mask_bio = BytesIO(mask)
+            mask_bio.name = "mask.png"
+            edit_kwargs["mask"] = mask_bio
         try:
             result = client.images.edit(**edit_kwargs, output_format="png")
         except TypeError:
@@ -721,10 +1150,157 @@ STEP3_TEXT_LAYOUT_PROMPT = (
 
 STEP3_5_IMAGE_GEN_PROMPT = (
     "상세페이지 이미지 만들어\n"
-    "문구는 아래 문구만 사용해"
+    "문구는 아래 문구만 그대로 사용해\n"
+    "문구를 수정하면 안 돼"
 )
 
-STEP6_TEXT_REMOVE_PROMPT = "아래 영역을 지운 이미지 생성해.\n영역내 글자만 지워.\n영역 이외는 절대 수정하지 마.\n영역내에서도 도형, 로고, 이미지는 지우면 안 돼"
+"""
+STEP6_TEXT_REMOVE_PROMPT = (
+    "첨부한 마스크 영역을 지운 이미지 생성해.\n"
+    "영역내 글자만 지워.\n"
+    "지운 부분은 배경을 자연스럽게 복원해.\n"
+    "상자, 테두리, 선, 아이콘 등 디자인 요소를 추가하지 마.\n"
+    "영역 이외는 절대 수정하지 마.\n"
+    "영역내에서도 도형, 로고, 이미지는 지우면 안 돼\n"
+)
+"""
+
+STEP6_TEXT_REMOVE_PROMPT = (
+    "이미지의 마스크 영역은 원래 글자 또는 얼룩이 있던 영역입니다.\n"
+    "마스크 영역 안에서 글자, 얼룩, 잔상만 제거하고,\n"
+    "그 아래에 원래 있었던 배경/디자인 표면을 자연스럽게 복원해 주세요.\n"
+    "마스크 주변 약 20px~50px 범위의 색상, 질감, 그라데이션, 그림자, 하이라이트, 패턴, 도형 흐름을 참고해서\n"
+    "마스크 영역 안이 주변과 끊김 없이 이어지도록 채워 주세요.\n"
+    "중요:\n"
+    "- 마스크 영역 밖은 절대 수정하지 마세요.\n"
+    "- 마스크 영역 안에 새 글자를 만들지 마세요.\n"
+    "- 새 상자, 테두리, 선, 아이콘, 장식 요소를 추가하지 마세요.\n"
+    "- 원래 없던 디자인을 새로 만들지 마세요.\n"
+    "- 단순히 흰색 배경으로 덮지 마세요.\n"
+    "- 마스크 주변에 있는 기존 디자인 요소가 마스크 안으로 이어져야 한다면, 그 형태와 색감을 자연스럽게 연장해 주세요.\n"
+    "- 캡슐형 바, 카드 박스, 그라데이션 배경, 사진 배경, 아이콘 영역, 장식 패턴 등 어떤 디자인이든 주변 정보를 기준으로 자연스럽게 복원해 주세요.\n"
+)
+
+"""
+STEP6_TEXT_REMOVE_PROMPT = (
+    "Remove the masked area and fill with matching surrounding background texture.\n"
+    "Edit only the transparent pixels of the provided mask.\n"
+    "Do not remove or alter any text outside the transparent mask area.\n"
+    "Do not redesign, simplify, clean up, crop, move, or reinterpret the image.\n"
+    "Do not add borders, boxes, guides, icons, or new design elements.\n"
+)
+"""
+
+OVERLAY_REFINE_PROMPT_HEAD = (
+    "이 이미지에 아래 문구를 넣으려고 해. 위치와 색을 확인해 보고 "
+    "더 적합하도록 아래 정보를 수정해 봐.\n"
+)
+OVERLAY_REFINE_OUTPUT_GUIDE = (
+    "\n\n"
+    "출력은 JSON 객체 하나로만 해. 형식: {\"lines\": [...]}.\n"
+    "lines 배열의 각 항목은 입력과 동일한 키를 유지해 "
+    "(text, x, y, width, height, font_size, font_color, style, align). "
+    "x, y, width, height 는 정수 픽셀, font_color 는 '#RRGGBB', "
+    "style 은 'bold' 또는 'normal', align 은 'left' | 'center' | 'right' 중 하나. "
+    "라인 개수와 순서는 입력과 동일하게 유지해."
+)
+OVERLAY_REFINE_SYSTEM_INSTRUCTION = (
+    "You output only one valid JSON object. "
+    "No markdown fences, no natural language before or after the JSON."
+)
+
+
+def _refine_overlay_layout_sync(
+    api_key: str,
+    vision_model: str,
+    image_b64_png: str,
+    current_lines: list[dict[str, Any]],
+    image_width: int | None = None,
+    image_height: int | None = None,
+    reasoning_effort: str | None = None,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """글자 제거 이미지 + 현재 합성 정보를 GPT 비전에 보내 다듬어진 lines 반환.
+
+    image_width / image_height 를 받아 프롬프트에 좌표계 grounding 을 명시한다.
+
+    Returns: (refined_lines, vision_prompt, raw_response)
+    실패 시 원본 lines 그대로 반환 (raw 는 빈 문자열).
+    """
+    grounding = ""
+    if image_width and image_height:
+        grounding = f"""
+이미지 크기는 {image_width}×{image_height} px 이야.
+좌표는 이미지 좌상단을 (0, 0) 으로 두고,
+x는 오른쪽으로, y는 아래쪽으로 증가하는 정수 픽셀 좌표계를 사용해.
+각 라인의 x, y는 라인 박스의 좌상단 모서리야.
+width/height는 박스의 가로·세로 길이야.
+라인의 우하단 모서리는 (x+width, y+height)야.
+중요 규칙:
+- 출력은 JSON 객체 하나만 반환해.
+- 형식은 반드시 {{"lines": [...]}} 로 유지해.
+- lines 배열의 라인 개수와 순서는 입력과 동일하게 유지해.
+- x, y, width, height는 모두 정수 픽셀로 반환해.
+- 모든 라인은 이미지 안에 있어야 해.
+- 기존 위치가 크게 틀리지 않으면 ±50px 이내에서만 보정해.
+- 특별한 이유가 없으면 모든 문구의 align은 "left"로 해.
+- font_color는 배경 대비가 좋게 조정하되, 제품 톤과 어울리는 색을 우선 사용해.
+수정 전 JSON:
+        """
+        
+    user_text = (
+        OVERLAY_REFINE_PROMPT_HEAD
+        + grounding
+        + json.dumps(current_lines, ensure_ascii=False, indent=2)
+        + OVERLAY_REFINE_OUTPUT_GUIDE
+    )
+    data_uri = f"data:image/png;base64,{image_b64_png}"
+    client = OpenAI(api_key=api_key)
+    input_messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": user_text},
+                {"type": "input_image", "image_url": data_uri},
+            ],
+        },
+    ]
+    base_kwargs: dict[str, Any] = {
+        "model": vision_model,
+        "input": input_messages,
+        "instructions": OVERLAY_REFINE_SYSTEM_INSTRUCTION,
+    }
+    if reasoning_effort:
+        base_kwargs["reasoning"] = {"effort": reasoning_effort}
+    try:
+        resp = client.responses.create(
+            **base_kwargs,
+            text={"format": {"type": "json_object"}},
+        )
+    except Exception:
+        # reasoning 미지원 또는 text.format 미지원 모델 대비 단계별 fallback
+        fallback_kwargs = {k: v for k, v in base_kwargs.items() if k != "reasoning"}
+        try:
+            resp = client.responses.create(
+                **fallback_kwargs,
+                text={"format": {"type": "json_object"}},
+            )
+        except Exception:
+            resp = client.responses.create(**fallback_kwargs)
+    raw = (getattr(resp, "output_text", None) or "").strip()
+    _, parsed = _parse_gpt_json(raw)
+    refined: list[dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        candidate = parsed.get("lines")
+        if isinstance(candidate, list):
+            for ln in candidate:
+                if isinstance(ln, dict):
+                    refined.append(ln)
+    if not refined:
+        return (current_lines, user_text, raw)
+    # 원본과 같은 길이가 아니면 안전을 위해 원본 사용
+    if len(refined) != len(current_lines):
+        return (current_lines, user_text, raw)
+    return (refined, user_text, raw)
 
 
 _LABEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -810,14 +1386,21 @@ _DECORATION_CHARSET = (
 )
 _LEADING_DECORATION_RE = re.compile(rf"^[{_DECORATION_CHARSET}]+")
 _TRAILING_DECORATION_RE = re.compile(rf"[{_DECORATION_CHARSET}]+$")
+# 앞쪽 일련번호 (예: "(3). ", "1. ", "[3] ", "1) ") 제거용
+_LEADING_NUMBER_LABEL_RE = re.compile(r"^\s*[\(\[]?\d{1,3}[\)\]]?[.:]?\s+")
 
 
 _INTERNAL_QUOTE_RE = re.compile(r"['\"‘’“”]")
 
 
 def _strip_leading_decoration(s: str) -> str:
-    """선행/후행 불릿·따옴표·문장부호·장식 문자 제거 (• · ♥ - * ' " . , ! ? 등)."""
+    """선행/후행 불릿·따옴표·문장부호·장식 문자 제거 (• · ♥ - * ' " . , ! ? 등).
+
+    추가로 OCR 이 잡곤 하는 일련번호 라벨 ('(3). ', '1. ', '[3] ', '1) ' 등) 도
+    선행 부분에서 제거한다 — 그래야 layout 텍스트(번호 없는 본문) 와 매칭된다.
+    """
     s = (s or "").strip()
+    s = _LEADING_NUMBER_LABEL_RE.sub("", s)
     s = _LEADING_DECORATION_RE.sub("", s)
     s = _TRAILING_DECORATION_RE.sub("", s)
     return s
@@ -870,9 +1453,10 @@ def _sample_text_color_and_weight(
 ) -> tuple[str, str]:
     """OCR 영역 픽셀에서 글자색(평균 RGB) + bold 여부를 추정.
 
-    - 글자색: 배경 대비 가장 어두운/밝은 픽셀(글자에 해당) 의 평균 RGB
-    - bold: 글자 픽셀 비율 (>= 0.18) 이면 'bold', 아니면 'normal'
-    실패 시 ('#111111', 'bold') 반환.
+    - 다크/라이트 후보를 둘 다 뽑고, 면적이 적은 쪽을 글자로 선택한다.
+      (글자는 보통 stroke 라서 배경보다 면적이 작다 — 회색 배경 + 흰 글자
+       처럼 평균이 중간으로 가는 케이스에서도 잘 동작.)
+    - bold: 글자 픽셀 밀도 (>= 0.18) 이면 'bold', 아니면 'normal'.
     """
     try:
         x, y, w, h = box
@@ -889,33 +1473,67 @@ def _sample_text_color_and_weight(
         pixels = list(crop.getdata())
         if not pixels:
             return ("#111111", "bold")
-        # 각 픽셀의 명도(luminance)
+        n = len(pixels)
         lums = [0.299 * r + 0.587 * g + 0.114 * b for (r, g, b) in pixels]
-        mean_lum = sum(lums) / len(lums)
-        # 배경이 밝으면(>128) 글자는 어두운 픽셀, 반대면 밝은 픽셀
-        if mean_lum >= 128:
-            text_pixels = [
-                pixels[i] for i, lm in enumerate(lums) if lm < mean_lum - 25
-            ]
+        # 양쪽 분위수에서 다크/라이트 평균 명도 추정
+        sorted_lums = sorted(lums)
+        q = max(1, n // 5)
+        dark_lum = sum(sorted_lums[:q]) / q
+        light_lum = sum(sorted_lums[-q:]) / q
+        contrast = light_lum - dark_lum
+        if contrast < 25:
+            # 거의 균일 → 평균색을 그대로 반환
+            ar = sum(p[0] for p in pixels) / n
+            ag = sum(p[1] for p in pixels) / n
+            ab = sum(p[2] for p in pixels) / n
+            return (f"#{int(ar):02X}{int(ag):02X}{int(ab):02X}", "normal")
+        # 중간 명도를 경계로 다크/라이트 픽셀을 분리
+        mid = (dark_lum + light_lum) / 2
+        margin = max(15.0, contrast * 0.15)
+        dark_pixels = [pixels[i] for i, lm in enumerate(lums) if lm < mid - margin]
+        light_pixels = [pixels[i] for i, lm in enumerate(lums) if lm > mid + margin]
+        # 둘 중 면적이 적은 쪽을 글자로 (글자는 보통 stroke 라서 적음)
+        if not dark_pixels and not light_pixels:
+            ar = sum(p[0] for p in pixels) / n
+            ag = sum(p[1] for p in pixels) / n
+            ab = sum(p[2] for p in pixels) / n
+            return (f"#{int(ar):02X}{int(ag):02X}{int(ab):02X}", "normal")
+        if not light_pixels:
+            text_pixels = dark_pixels
+        elif not dark_pixels:
+            text_pixels = light_pixels
+        elif len(dark_pixels) <= len(light_pixels):
+            text_pixels = dark_pixels
         else:
-            text_pixels = [
-                pixels[i] for i, lm in enumerate(lums) if lm > mean_lum + 25
-            ]
-        if not text_pixels:
-            # 컨트라스트가 약하면 quantile 기반으로 다시 시도
-            sorted_idx = sorted(range(len(lums)), key=lambda k: lums[k])
-            cut = max(1, len(sorted_idx) // 6)
-            text_pixels = [pixels[i] for i in sorted_idx[:cut]]
-        n = len(text_pixels)
-        ar = sum(p[0] for p in text_pixels) / n
-        ag = sum(p[1] for p in text_pixels) / n
-        ab = sum(p[2] for p in text_pixels) / n
+            text_pixels = light_pixels
+        tn = len(text_pixels)
+        ar = sum(p[0] for p in text_pixels) / tn
+        ag = sum(p[1] for p in text_pixels) / tn
+        ab = sum(p[2] for p in text_pixels) / tn
         color = f"#{int(ar):02X}{int(ag):02X}{int(ab):02X}"
-        density = n / len(pixels)
+        density = tn / n
         weight = "bold" if density >= 0.18 else "normal"
         return (color, weight)
     except Exception:
         return ("#111111", "bold")
+
+
+_LEADING_BULLET_RE = re.compile(
+    r"^[\s•●·・‧∙◦▪▫■‣⁃]+"
+)
+
+
+def _strip_leading_bullet(text: Any) -> Any:
+    """맨 앞의 일련번호 라벨 + 불릿(•, ●, ·, ・ 등) + 인접 공백을 제거.
+    비문자열은 그대로 반환. (예: "(3). 자고..." → "자고...", "• 효과..." → "효과...")
+    """
+    if not isinstance(text, str):
+        return text
+    out = _LEADING_NUMBER_LABEL_RE.sub("", text)
+    out = _LEADING_BULLET_RE.sub("", out)
+    # 일련번호 + 불릿이 결합된 경우 (예: "(3). • 자고...") 한 번 더 시도
+    out = _LEADING_NUMBER_LABEL_RE.sub("", out)
+    return out
 
 
 def _apply_pixel_styles_to_lines(
@@ -1034,9 +1652,6 @@ def _merge_ocr_group_box(lines: list[dict[str, Any]]) -> dict[str, Any]:
         "width": max(0, x1 - x0),
         "height": max(0, y1 - y0),
         "font_size": int(first.get("font_size") or 0),
-        "align": first.get("align", "left"),
-        "font_color": first.get("font_color", "#111111"),
-        "style": first.get("style", "bold"),
         "_members": [dict(ln) for ln in lines],
     }
 
@@ -1267,1592 +1882,194 @@ def _openai_image_edit_sync(
     return {"b64_json": b64_data, "output_width": gw, "output_height": gh}
 
 
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>상세페이지 프롬프트 생성</title>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard",
-        "Noto Sans KR", sans-serif;
-      margin: 0; padding: 24px;
-      background: linear-gradient(135deg, #f5f7fa 0%, #e8eef5 100%);
-      color: #1f2937;
-    }
-    h1 { font-size: 24px; margin: 0 0 16px; }
-    .container { max-width: none; margin: 0; }
-    .progress-row {
-      display: flex; gap: 18px; align-items: flex-start; flex-wrap: nowrap;
-      margin-bottom: 18px;
-    }
-    .progress-row > .progress-left {
-      flex: 0 0 800px; max-width: 800px; min-width: 0;
-      display: flex; flex-direction: column; gap: 18px;
-      max-height: calc(100vh - 110px); overflow-y: auto;
-    }
-    .progress-row > .progress-left > .card { margin-bottom: 0; }
-    .progress-row > #overlayHistoryCard {
-      flex: 0 0 1000px; max-width: 1000px; min-width: 0; margin-bottom: 0;
-      max-height: calc(100vh - 110px); overflow-y: auto;
-    }
-    @media (max-width: 1850px) {
-      .progress-row { flex-wrap: wrap; }
-      .progress-row > .progress-left {
-        flex: 1 1 100%; max-width: 800px;
-        max-height: none; overflow-y: visible;
-      }
-      .progress-row > #overlayHistoryCard {
-        flex: 1 1 100%; max-width: 1000px;
-        max-height: none; overflow-y: visible;
-      }
-    }
-    .overlay-history-entry {
-      margin-top: 12px; padding: 8px 10px;
-      border: 1px solid #e5e7eb; border-radius: 6px; background: #f8fafc;
-    }
-    .overlay-history-entry:first-of-type { margin-top: 0; }
-    .overlay-history-entry > .ohe-title {
-      font-weight: 600; font-size: 13px; margin-bottom: 6px; color: #1e293b;
-    }
-    .overlay-history-entry > .ohe-meta {
-      font-size: 12px; color: #64748b; margin-bottom: 6px;
-    }
-    .overlay-history-entry .ohe-preview { max-width: 100%; }
-    .card {
-      background: #fff; border-radius: 14px; padding: 22px;
-      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
-      margin-bottom: 18px;
-    }
-    label { display: block; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
-    textarea {
-      width: 100%; padding: 10px 12px; border: 1px solid #d1d5db;
-      border-radius: 8px; font-size: 14px; font-family: inherit;
-      background: #fff;
-    }
-    textarea { min-height: 120px; resize: vertical; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-    @media (max-width: 720px) { .row { grid-template-columns: 1fr; } }
-    button {
-      background: #2563eb; color: #fff; border: 0; padding: 12px 22px;
-      border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer;
-    }
-    button:disabled { background: #94a3b8; cursor: not-allowed; }
-    .progress-line {
-      padding: 6px 10px; border-left: 3px solid #2563eb;
-      margin: 4px 0; font-size: 13px; color: #374151; background: #f8fafc;
-      border-radius: 4px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-    .progress-line.running { border-color: #f59e0b; color: #92400e; background: #fffbeb; }
-    .progress-line.done { border-color: #16a34a; color: #166534; background: #f0fdf4; }
-    .progress-line.error { border-color: #dc2626; color: #b91c1c; background: #fef2f2; }
-    .progress-line.skip { border-color: #94a3b8; color: #475569; background: #f1f5f9; }
-    .progress-line .badge {
-      display: inline-block; min-width: 64px; text-align: center;
-      padding: 1px 6px; border-radius: 4px; margin-right: 6px;
-      font-size: 11px; font-weight: 700; letter-spacing: .3px;
-      background: #e5e7eb; color: #374151;
-    }
-    .progress-line.running .badge { background: #fef3c7; color: #92400e; }
-    .progress-line.done .badge { background: #dcfce7; color: #166534; }
-    .progress-line.error .badge { background: #fee2e2; color: #b91c1c; }
-    .progress-line.skip .badge { background: #e2e8f0; color: #475569; }
-    .progress-line .dur { float: right; color: #6b7280; }
-    .progress-line .step-num {
-      display: inline-block; min-width: 22px; margin-right: 4px;
-      color: #1f2937; font-weight: 700;
-    }
-    .label-edit-wrap {
-      position: relative; display: block; max-width: 100%;
-      margin: 0 auto;
-      line-height: 0; container-type: inline-size;
-    }
-    .label-edit-wrap > img.label-edit-base {
-      display: block; width: 100%; height: auto;
-      border-radius: 8px; border: 1px solid #e5e7eb; background: #fff;
-      user-select: none;
-    }
-    .label-edit-box {
-      position: absolute; box-sizing: border-box; padding: 0; margin: 0;
-      line-height: 1.2; white-space: nowrap; overflow: visible;
-      font-family: "Noto Sans KR","Pretendard","Malgun Gothic",sans-serif;
-      outline: none; background: transparent;
-      cursor: move; user-select: none;
-    }
-    .label-edit-box.selected {
-      outline: 2px solid #2563eb;
-      background: rgba(37,99,235,0.06);
-    }
-    .label-edit-box[contenteditable="true"] {
-      cursor: text; user-select: text;
-      outline: 2px solid #16a34a !important;
-      background: rgba(22,163,74,0.06);
-    }
-    /* 글자 영역 테두리 표시 (체크박스 토글) */
-    .show-text-bounds .label-edit-box::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border: 1px dashed #ef4444;
-      pointer-events: none;
-    }
-    .step-result {
-      margin: 4px 0 10px 12px; padding: 8px 10px;
-      background: #fff; border: 1px solid #e5e7eb; border-radius: 6px;
-      font-size: 12px; color: #374151;
-    }
-    .step-result pre {
-      margin: 6px 0 0; padding: 8px; background: #0f172a; color: #e2e8f0;
-      border-radius: 6px; max-height: 220px; overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      white-space: pre-wrap; word-break: break-word; font-size: 12px;
-    }
-    .meta { color: #6b7280; font-size: 13px; margin: 0 0 12px; line-height: 1.5; }
-    .dropzone {
-      position: relative;
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 6px;
-      min-height: 140px; padding: 18px;
-      border: 2px dashed #cbd5e1; border-radius: 12px;
-      background: #f8fafc; color: #475569;
-      cursor: pointer; text-align: center;
-      transition: border-color .15s, background-color .15s;
-    }
-    .dropzone:hover { border-color: #94a3b8; background: #f1f5f9; }
-    .dropzone.dragover {
-      border-color: #2563eb; background: #eff6ff; color: #1d4ed8;
-    }
-    .dropzone .dz-title { font-weight: 600; font-size: 14px; display: block; }
-    .dropzone .dz-sub { font-size: 12px; color: #64748b; display: block; margin-top: 4px; }
-    .dropzone .dz-fname {
-      display: block; margin-top: 8px; font-size: 12px; color: #1d4ed8; font-weight: 600;
-      word-break: break-all;
-    }
-    .dropzone .dz-preview {
-      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; justify-content: center;
-      width: 100%;
-    }
-    .dropzone .dz-preview img {
-      max-width: 160px; max-height: 160px;
-      border-radius: 8px; border: 1px solid #e5e7eb; object-fit: contain; background: #fff;
-    }
-    .gpt-out {
-      background: #0f172a; color: #e2e8f0; font-size: 13px; line-height: 1.55;
-      border-radius: 8px; padding: 14px; max-height: 520px; overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      white-space: pre-wrap; word-break: break-word;
-      margin: 0; border: 1px solid #1e293b;
-    }
-    .gen-img-wrap {
-      border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px;
-      background: #f8fafc; text-align: center; margin-bottom: 14px;
-    }
-    .gen-img-wrap img {
-      max-width: 100%; height: auto; border-radius: 8px;
-      border: 1px solid #e5e7eb; object-fit: contain; background: #fff;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>상세페이지 이미지 프롬프트 생성</h1>
-
-    <div class="progress-row" id="progressRow">
-      <div class="progress-left">
-        <div class="card" id="inputCard">
-          <form id="genForm">
-            <div>
-              <label style="display:block">제품 사진</label>
-              <label class="dropzone" id="productDz" for="file">
-                <span class="dz-title">클릭 또는 파일을 여기로 드래그</span>
-                <span class="dz-fname" id="fileName"></span>
-                <span class="dz-preview" id="previewBox"></span>
-              </label>
-              <input type="file" id="file" name="file" accept="image/*" required style="display:none" />
-            </div>
-            <div style="margin-top:14px">
-              <label for="prompt">추가 프롬프트 (선택)</label>
-              <textarea id="prompt" name="prompt" placeholder="상품에 대한 추가 설명이 있으면 입력하세요. OCR 결과 아래에 함께 붙습니다."></textarea>
-            </div>
-
-            <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-              <button type="submit" id="submitBtn">생성</button>
-            </div>
-          </form>
-        </div>
-        <div class="card" id="progressCard" style="display:none">
-          <h2 style="margin-top:0;font-size:18px">진행 상황</h2>
-          <div id="progressBox"></div>
-        </div>
-      </div>
-      <div class="card" id="overlayHistoryCard" style="display:none">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px;flex-wrap:wrap">
-          <h2 style="margin:0;font-size:18px">글자 합성 결과 (페이지별)</h2>
-          <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;color:#374151;cursor:pointer;user-select:none">
-            <input type="checkbox" id="toggleTextBounds" style="margin:0">
-            글자 영역 테두리 표시
-          </label>
-        </div>
-        <p class="meta" style="font-size:12px;color:#64748b;margin:0 0 10px">
-          글자 제거 이미지 + 합성된 글자(canvas) — 페이지마다 누적 표시
-        </p>
-        <div id="overlayHistoryBox"></div>
-      </div>
-    </div>
-
-    <div class="card" id="vizCard" style="display:none">
-      <h3 id="cleanedOcrTitle" style="display:none;margin:0 0 8px;font-size:16px">6단계 결과: 글자 제거 이미지 OCR (라인+좌표)</h3>
-      <p class="meta" id="cleanedOcrMeta" style="display:none"></p>
-      <pre id="cleanedOcrOut" class="gpt-out" style="max-height:280px;margin-top:6px;display:none"></pre>
-
-      <h3 id="areaDiffTitle" style="display:none;margin:18px 0 8px;font-size:16px">7단계 결과: 사라진 OCR 영역 (원본 ∖ 글자 제거)</h3>
-      <p class="meta" id="areaDiffMeta" style="display:none"></p>
-      <pre id="areaDiffOut" class="gpt-out" style="max-height:280px;margin-top:6px;display:none"></pre>
-
-      <h3 id="labeledTitle" style="display:none;margin:18px 0 8px;font-size:16px">문구를 합성한 이미지 (좌표 JSON 적용)</h3>
-      <div class="gen-img-wrap" id="labeledImgWrap" style="display:none"></div>
-    </div>
-  </div>
-
-  <script>
-    window.addEventListener("error", (ev) => {
-      const box = document.getElementById("progressBox");
-      if (!box) return;
-      const card = document.getElementById("progressCard");
-      if (card) card.style.display = "block";
-      const div = document.createElement("div");
-      div.className = "progress-line error";
-      div.textContent = "JS 오류: " + (ev.message || ev.error || "");
-      box.appendChild(div);
-    });
-
-    const $ = (id) => document.getElementById(id);
-    const stepRows = {}; // step -> { line, result }
-    let lastGeneratedImageB64 = null;
-    let stepCounter = 0;
-    const stepInputs = { ocr: null, gpt: null, image_gen: null, image_gen2: null,
-                         image_gen_ocr: null, image_gen_text: null, cleaned_ocr: null,
-                         text_area_diff: null, removed_text_overlay: null, vision_layout: null };
-    // 다음 페이지 생성용 상태
-    let allImagePrompts = null;     // gpt 단계 결과의 image_prompts (배열)
-    let nextPageToGen = 2;          // 다음에 생성할 페이지 번호 (1-based, 첫 페이지=1 은 메인 파이프라인)
-
-    function extractLabels(layoutJson) {
-      if (!layoutJson) return [];
-      if (Array.isArray(layoutJson)) return layoutJson;
-      for (const k of Object.keys(layoutJson)) {
-        if (Array.isArray(layoutJson[k])) return layoutJson[k];
-      }
-      return [];
-    }
-
-    function renderLabelsOnImage(b64, labels, onDone) {
-      if (!b64) return onDone(null);
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0);
-        const fontFamily = '"Noto Sans KR","Pretendard","Malgun Gothic",sans-serif';
-        for (const lab of labels) {
-          if (!lab || typeof lab !== "object") continue;
-          const text = String(lab.text == null ? "" : lab.text);
-          if (!text) continue;
-          const x = Number(lab.x || 0);
-          const y = Number(lab.y || 0);
-          const fontSize = Number(lab.font_size || 32);
-          const styleStr = String(lab.style || "").toLowerCase();
-          const isBold = styleStr.includes("bold") || styleStr.includes("heavy");
-          const isItalic = styleStr.includes("italic");
-          const color = String(lab.font_color || "#111");
-          const align = (lab.align === "center" || lab.align === "right") ? lab.align : "left";
-          let weight = isBold ? "bold" : "normal";
-          let italic = isItalic ? "italic " : "";
-          ctx.font = italic + weight + " " + fontSize + "px " + fontFamily;
-          ctx.fillStyle = color;
-          ctx.textAlign = align;
-          ctx.textBaseline = "top";
-          const lineH = fontSize * 1.25;
-          const lines = text.split(/\\r?\\n/);
-          let drawX = x;
-          if (lab.width && align === "center") drawX = x + Number(lab.width) / 2;
-          else if (lab.width && align === "right") drawX = x + Number(lab.width);
-          lines.forEach((line, i) => {
-            ctx.fillText(line, drawX, y + i * lineH);
-          });
-        }
-        onDone(canvas);
-      };
-      img.onerror = () => onDone(null);
-      img.src = "data:image/png;base64," + b64;
-    }
-
-    let activeOverlayBox = null;
-
-    function _deselectOverlayBox() {
-      if (activeOverlayBox) {
-        activeOverlayBox.classList.remove("selected");
-        activeOverlayBox.contentEditable = "false";
-        try { activeOverlayBox.blur(); } catch (_) {}
-      }
-      activeOverlayBox = null;
-    }
-
-    function _selectOverlayBox(box) {
-      if (activeOverlayBox && activeOverlayBox !== box) _deselectOverlayBox();
-      activeOverlayBox = box;
-      box.classList.add("selected");
-    }
-
-    function _startDragOverlayBox(box, startEvt) {
-      const wrap = box.parentElement;
-      if (!wrap) return;
-      const wrapRect = wrap.getBoundingClientRect();
-      const startX = startEvt.clientX;
-      const startY = startEvt.clientY;
-      const origLeftPct = parseFloat(box.style.left) || 0;
-      const origTopPct = parseFloat(box.style.top) || 0;
-      function onMove(e) {
-        const dxPx = e.clientX - startX;
-        const dyPx = e.clientY - startY;
-        const dxPct = wrapRect.width > 0 ? (dxPx / wrapRect.width * 100) : 0;
-        const dyPct = wrapRect.height > 0 ? (dyPx / wrapRect.height * 100) : 0;
-        box.style.left = (origLeftPct + dxPct).toFixed(3) + "%";
-        box.style.top = (origTopPct + dyPct).toFixed(3) + "%";
-      }
-      function onUp() {
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-      }
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    }
-
-    function _outsideMouseDownDeselect(e) {
-      if (!activeOverlayBox) return;
-      if (e.target.closest && e.target.closest(".label-edit-box") === activeOverlayBox) return;
-      _deselectOverlayBox();
-    }
-    document.addEventListener("mousedown", _outsideMouseDownDeselect);
-
-    function renderLabelsAsDOM(b64, labels, container) {
-      if (!container) return;
-      container.innerHTML = "";
-      if (!b64) return;
-      const img = new Image();
-      img.onload = () => {
-        const natW = img.naturalWidth || 1;
-        const natH = img.naturalHeight || 1;
-
-        const wrap = document.createElement("div");
-        wrap.className = "label-edit-wrap";
-        wrap.style.width = natW + "px";
-        wrap.style.aspectRatio = natW + " / " + natH;
-
-        const baseImg = document.createElement("img");
-        baseImg.className = "label-edit-base";
-        baseImg.src = "data:image/png;base64," + b64;
-        baseImg.draggable = false;
-        wrap.appendChild(baseImg);
-
-        for (const lab of (labels || [])) {
-          if (!lab || typeof lab !== "object") continue;
-          const text = String(lab.text == null ? "" : lab.text);
-          const x = Number(lab.x || 0);
-          const y = Number(lab.y || 0);
-          const w = Number(lab.width || 100);
-          const h = Number(lab.height || 30);
-          const fontSize = Number(lab.font_size || Math.max(12, h * 0.85));
-          const color = String(lab.font_color || "#111");
-          const styleStr = String(lab.style || "").toLowerCase();
-          const isBold = styleStr.includes("bold") || styleStr.includes("heavy");
-          const isItalic = styleStr.includes("italic");
-          const align = (lab.align === "center" || lab.align === "right") ? lab.align : "left";
-
-          const box = document.createElement("div");
-          box.className = "label-edit-box";
-          box.textContent = text;
-          box.contentEditable = "false";
-          box.spellcheck = false;
-          box.dataset.origX = String(x);
-          box.dataset.origY = String(y);
-          box.dataset.origW = String(w);
-          box.dataset.origH = String(h);
-          box.style.left = (x / natW * 100).toFixed(3) + "%";
-          box.style.top = (y / natH * 100).toFixed(3) + "%";
-          box.style.width = (w / natW * 100).toFixed(3) + "%";
-          box.style.minHeight = (h / natH * 100).toFixed(3) + "%";
-          // 컨테이너 가로 크기 대비 비율로 폰트 크기 (cqi: 컨테이너 가로 1% 단위)
-          box.style.fontSize = (fontSize / natW * 100).toFixed(3) + "cqi";
-          box.style.color = color;
-          box.style.fontWeight = isBold ? "bold" : "normal";
-          box.style.fontStyle = isItalic ? "italic" : "normal";
-          box.style.textAlign = align;
-
-          box.addEventListener("mousedown", (e) => {
-            if (box.contentEditable === "true") return;
-            e.stopPropagation();
-            e.preventDefault();
-            _selectOverlayBox(box);
-            _startDragOverlayBox(box, e);
-          });
-          box.addEventListener("dblclick", (e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            _selectOverlayBox(box);
-            box.contentEditable = "true";
-            box.focus();
-            // 전체 선택
-            try {
-              const range = document.createRange();
-              range.selectNodeContents(box);
-              const sel = window.getSelection();
-              sel.removeAllRanges();
-              sel.addRange(range);
-            } catch (_) {}
-          });
-          box.addEventListener("blur", () => {
-            box.contentEditable = "false";
-          });
-
-          wrap.appendChild(box);
-        }
-
-        container.appendChild(wrap);
-      };
-      img.onerror = () => { container.textContent = "이미지 로드 실패"; };
-      img.src = "data:image/png;base64," + b64;
-    }
-
-    function renderLabeledCanvas(b64, labels) {
-      renderLabelsOnImage(b64, labels, (canvas) => {
-        if (!canvas) return;
-        canvas.style.maxWidth = "100%";
-        canvas.style.height = "auto";
-        canvas.style.borderRadius = "8px";
-        canvas.style.border = "1px solid #e5e7eb";
-        canvas.style.background = "#fff";
-        const wrap = $("labeledImgWrap");
-        wrap.innerHTML = "";
-        wrap.appendChild(canvas);
-        wrap.style.display = "block";
-        $("labeledTitle").style.display = "block";
-      });
-    }
-
-    let lastImageWithTextB64 = null;
-
-    // 다음 페이지 생성: 페이지 접미사(__pN)가 붙은 step 이벤트 처리.
-    // 메인 파이프라인의 단일-페이지 상태(stepInputs, lastImageWithTextB64 등)는 건드리지 않는다.
-    function handlePageStreamEvent(ev) {
-      const stepKey = ev.step || "";
-      const m = stepKey.match(/^(.+?)__p(\d+)$/);
-      // 페이지 단위 complete 이벤트는 step 이 없고 page 필드로 식별
-      if (!m && ev.event === "complete" && ev.page != null) {
-        appendInfo("페이지 " + ev.page + " 완료 — 소요 " + fmtSec(ev.elapsed) +
-          " (상태: " + (ev.status || "ok") + ")",
-          ev.status === "ok" ? "done" : "error");
-        return true;
-      }
-      if (!m) return false;
-      const baseStep = m[1];
-      const pageNum = Number(m[2]);
-      if (ev.event === "step_start") {
-        startStep(stepKey, ev.label || stepKey, ev.elapsed);
-        const sd = ev.data || {};
-        if (sd.model) {
-          appendStepDetail(stepKey, "사용 AI 모델:", sd.model);
-        }
-        if (baseStep === "image_gen2" && sd.image_prompt) {
-          appendStepDetail(stepKey,
-            "이미지 생성 API 전달 프롬프트 (제품 사진 + 문구):",
-            sd.image_prompt);
-        }
-        return true;
-      }
-      if (ev.event === "step_done") {
-        // 재실행 버튼이 step_done 후 finishStep 에서 표시되도록 stepInputs 에 컨텍스트 저장.
-        // image_gen2__pN 만 재실행을 지원 (페이지 N 의 4~7 단계 전체를 다시 실행).
-        if (baseStep === "image_gen2") {
-          stepInputs[stepKey] = { kind: "next-page", pageNum: pageNum };
-        }
-        finishStep(stepKey, "완료", "done", ev.elapsed, ev.step_elapsed);
-        const d = ev.data || {};
-        const row = stepRows[stepKey];
-        if (!row) return true;
-        row.result.style.display = "block";
-        if (baseStep === "image_gen2") {
-          const note = document.createElement("div");
-          note.textContent = "페이지 " + pageNum + " 이미지 " +
-            (d.first_image_width || "?") + "×" + (d.first_image_height || "?") + " 생성됨.";
-          note.style.fontWeight = "600";
-          note.style.marginTop = "6px";
-          const thumb = document.createElement("img");
-          thumb.src = "data:image/png;base64," + d.first_image_b64;
-          thumb.style.maxWidth = "540px";
-          thumb.style.marginTop = "4px";
-          thumb.style.border = "1px solid #e5e7eb";
-          thumb.style.borderRadius = "6px";
-          row.result.appendChild(note);
-          row.result.appendChild(thumb);
-        } else if (baseStep === "image_gen_ocr") {
-          appendStepDetail(stepKey,
-            "OCR 라인 (" + (d.line_count || 0) + "개, " + (d.ocr_chars || 0) + "자):",
-            JSON.stringify(d.lines || [], null, 2));
-        } else if (baseStep === "image_gen_text") {
-          const note = document.createElement("div");
-          note.textContent = "페이지 " + pageNum + " 글자 제거 이미지 " +
-            (d.image_width || "?") + "×" + (d.image_height || "?") + ".";
-          note.style.fontWeight = "600";
-          note.style.marginTop = "6px";
-          const thumb = document.createElement("img");
-          thumb.src = "data:image/png;base64," + d.image_b64;
-          thumb.style.maxWidth = "540px";
-          thumb.style.marginTop = "4px";
-          thumb.style.border = "1px solid #e5e7eb";
-          thumb.style.borderRadius = "6px";
-          row.result.appendChild(note);
-          row.result.appendChild(thumb);
-        } else if (baseStep === "removed_text_overlay") {
-          const lines = d.lines || [];
-          const base = d.base_image_b64;
-          appendStepDetail(stepKey,
-            "합성 라인 수:", String(d.line_count || lines.length || 0));
-          // 미리보기는 오른쪽 오버레이 히스토리 패널에 누적
-          addOverlayHistoryEntry(pageNum, base, lines, {
-            width: d.base_image_width,
-            height: d.base_image_height,
-          });
-        }
-        return true;
-      }
-      if (ev.event === "step_skip") {
-        startStep(stepKey, stepKey, ev.elapsed);
-        finishStep(stepKey, "건너뜀", "skip", ev.elapsed, null, ev.message);
-        return true;
-      }
-      if (ev.event === "step_error") {
-        if (!stepRows[stepKey]) startStep(stepKey, stepKey, ev.elapsed);
-        finishStep(stepKey, "오류", "error", ev.elapsed, ev.step_elapsed, ev.message);
-        return true;
-      }
-      return false;
-    }
-
-    // 오른쪽 "글자 합성 결과" 패널에 페이지별 항목을 추가/갱신.
-    // 동일 페이지 번호의 항목이 있으면 in-place 로 교체한다.
-    function addOverlayHistoryEntry(pageNum, base, lines, meta) {
-      const box = $("overlayHistoryBox");
-      const card = $("overlayHistoryCard");
-      if (!box || !card) return;
-      card.style.display = "block";
-      const id = "ohe-p" + pageNum;
-      let entry = document.getElementById(id);
-      if (!entry) {
-        entry = document.createElement("div");
-        entry.id = id;
-        entry.className = "overlay-history-entry";
-        entry.dataset.page = String(pageNum);
-        // 페이지 번호 순으로 정렬 삽입
-        const siblings = Array.from(box.querySelectorAll(".overlay-history-entry"));
-        let inserted = false;
-        for (const sib of siblings) {
-          if (Number(sib.dataset.page || 0) > pageNum) {
-            box.insertBefore(entry, sib);
-            inserted = true;
-            break;
-          }
-        }
-        if (!inserted) box.appendChild(entry);
-      } else {
-        entry.innerHTML = "";
-      }
-      const title = document.createElement("div");
-      title.className = "ohe-title";
-      title.textContent = "페이지 " + pageNum;
-      entry.appendChild(title);
-      const metaLine = document.createElement("div");
-      metaLine.className = "ohe-meta";
-      const w = (meta && meta.width) || "?";
-      const h = (meta && meta.height) || "?";
-      metaLine.textContent =
-        "이미지 " + w + "×" + h + " px · 라벨 " + (lines ? lines.length : 0) + "개";
-      entry.appendChild(metaLine);
-      const previewWrap = document.createElement("div");
-      previewWrap.className = "ohe-preview";
-      entry.appendChild(previewWrap);
-      renderLabelsAsDOM(base, lines || [], previewWrap);
-    }
-
-    // 8단계(removed_text_overlay) 결과 영역에 "다음 페이지 생성" 컨트롤을 (재)삽입.
-    function maybeAddNextPageControls(container) {
-      if (!container) return;
-      container.querySelectorAll(".next-page-controls").forEach((el) => el.remove());
-      if (!Array.isArray(allImagePrompts) || allImagePrompts.length <= 1) return;
-      const remaining = allImagePrompts.length - (nextPageToGen - 1);
-      if (remaining <= 0) {
-        const done = document.createElement("div");
-        done.className = "next-page-controls";
-        done.style.cssText = "margin-top:14px;padding:8px 10px;border:1px dashed #94a3b8;border-radius:6px;background:#f1f5f9;color:#475569;font-size:13px";
-        done.textContent = "모든 페이지(" + allImagePrompts.length + "장) 생성 완료.";
-        container.appendChild(done);
-        return;
-      }
-      const wrap = document.createElement("div");
-      wrap.className = "next-page-controls";
-      wrap.style.cssText = "margin-top:14px;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;display:flex;align-items:center;gap:8px;flex-wrap:wrap";
-
-      const label = document.createElement("label");
-      label.textContent = "추가 페이지 수:";
-      label.style.cssText = "font-weight:600;font-size:13px;margin:0";
-      wrap.appendChild(label);
-
-      const sel = document.createElement("select");
-      sel.className = "next-page-count";
-      sel.style.cssText = "padding:4px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px";
-      const opts = [];
-      if (remaining >= 1) opts.push({ v: "1", t: "1" });
-      if (remaining >= 2) opts.push({ v: "2", t: "2" });
-      opts.push({ v: "all", t: "전체 (" + remaining + ")" });
-      opts.forEach((o) => {
-        const op = document.createElement("option");
-        op.value = o.v;
-        op.textContent = o.t;
-        sel.appendChild(op);
-      });
-      wrap.appendChild(sel);
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = "다음 페이지 생성";
-      btn.style.cssText = "padding:6px 14px;font-size:13px;background:#2563eb;color:#fff;border:0;border-radius:6px;cursor:pointer";
-      btn.addEventListener("click", () => {
-        const v = sel.value;
-        let count = v === "all" ? remaining : Number(v);
-        if (!count || count < 1) return;
-        if (count > remaining) count = remaining;
-        btn.disabled = true;
-        sel.disabled = true;
-        const orig = btn.textContent;
-        btn.textContent = "생성 중...";
-        runNextPages(count).finally(() => {
-          btn.disabled = false;
-          sel.disabled = false;
-          btn.textContent = orig;
-          // 컨트롤을 다시 그려 남은 페이지 수 반영
-          maybeAddNextPageControls(container);
-        });
-      });
-      wrap.appendChild(btn);
-
-      const hint = document.createElement("span");
-      hint.style.cssText = "color:#64748b;font-size:12px;margin-left:auto";
-      hint.textContent = "남은 페이지 " + remaining + " 장 (전체 " + allImagePrompts.length + " 장)";
-      wrap.appendChild(hint);
-
-      container.appendChild(wrap);
-    }
-
-    async function runNextPages(count) {
-      const fileEl = $("file");
-      const file = fileEl && fileEl.files && fileEl.files[0];
-      if (!file) {
-        appendInfo("원본 제품 사진을 찾을 수 없습니다. 폼에서 다시 선택해주세요.", "error");
-        return;
-      }
-      if (!Array.isArray(allImagePrompts) || allImagePrompts.length === 0) {
-        appendInfo("image_prompts 목록이 없습니다.", "error");
-        return;
-      }
-      // 작업 목록을 먼저 만들고 nextPageToGen 을 한 번에 전진시킨 뒤, 모든 페이지를 병렬로 시작.
-      // 각 페이지의 스트림은 독립적으로 흐르며, 합성(removed_text_overlay) 이벤트가 도착하는 즉시
-      // addOverlayHistoryEntry(pageNum, ...) 가 오른쪽 패널에 페이지 번호 순으로 삽입한다.
-      const tasks = [];
-      for (let i = 0; i < count; i++) {
-        if (nextPageToGen > allImagePrompts.length) break;
-        const promptIdx = nextPageToGen - 1;
-        const pageNum = nextPageToGen;
-        nextPageToGen += 1;
-        tasks.push({ promptIdx, pageNum, prompt: allImagePrompts[promptIdx] });
-      }
-      if (!tasks.length) return;
-      appendInfo("페이지 " + tasks.map((t) => t.pageNum).join(", ") + " 병렬 생성 시작 (" + tasks.length + "개)");
-      await Promise.all(tasks.map(async (t) => {
-        const fd = new FormData();
-        fd.append("file", file, file.name);
-        fd.append("image_prompt_json", JSON.stringify(t.prompt));
-        fd.append("page_index", String(t.pageNum));
-        try {
-          const resp = await fetch("/api/next-page", { method: "POST", body: fd });
-          await consumeStream(resp);
-        } catch (e) {
-          appendInfo("페이지 " + t.pageNum + " 생성 오류: " + e, "error");
-        }
-      }));
-    }
-
-    function handleStreamEvent(ev) {
-      if (handlePageStreamEvent(ev)) return;
-      if (ev.event === "step_start") {
-        startStep(ev.step, ev.label || ev.step, ev.elapsed);
-        const sd = ev.data || {};
-        if (sd.model && ev.step !== "image_gen_text") {
-          appendStepDetail(ev.step, "사용 AI 모델:", sd.model);
-        }
-        if (ev.step === "image_gen_text" && Array.isArray(sd.available_options) && sd.available_options.length) {
-          const row = stepRows["image_gen_text"];
-          if (row) {
-            row.result.style.display = "block";
-            const wrap = document.createElement("div");
-            wrap.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:6px";
-            const lab = document.createElement("span");
-            lab.style.fontWeight = "600";
-            lab.textContent = "사용 AI 모델:";
-            const sel = document.createElement("select");
-            sel.style.cssText = "padding:4px 8px;font-size:13px;border:1px solid #cbd5e1;border-radius:6px;background:#fff";
-            const curM = String(sd.model || "");
-            const curQ = String(sd.quality || "");
-            for (const opt of sd.available_options) {
-              if (!opt || typeof opt !== "object") continue;
-              const o = document.createElement("option");
-              o.value = (opt.model || "") + "|" + (opt.quality || "");
-              o.textContent = opt.label || ((opt.model || "") + (opt.quality ? " (" + opt.quality + ")" : ""));
-              o.dataset.model = opt.model || "";
-              o.dataset.quality = opt.quality || "";
-              if ((opt.model || "") === curM && (opt.quality || "") === curQ) o.selected = true;
-              sel.appendChild(o);
-            }
-            wrap.appendChild(lab);
-            wrap.appendChild(sel);
-            row.result.appendChild(wrap);
-            row.modelSelect = sel;
-          }
-        }
-        if (ev.step === "gpt") {
-          if (sd.user_message) {
-            appendStepDetail(
-              "gpt",
-              "Gemini 전달 입력 메시지 (" + (sd.user_message_chars || sd.user_message.length) + "자)" +
-              (sd.has_product_image ? " + 업로드 제품 사진" : "") + ":",
-              sd.user_message
-            );
-          }
-          if ((sd.ui_prompt || "").trim()) {
-            appendStepDetail("gpt", "UI 추가 프롬프트:", sd.ui_prompt);
-          }
-        }
-        if (ev.step === "image_gen") {
-          if (sd.user_message) {
-            appendStepDetail("image_gen",
-              "OpenAI 챗 전달 프롬프트 (image_prompts[0] 포함):",
-              sd.user_message);
-          } else if (sd.image_prompt) {
-            appendStepDetail("image_gen",
-              "image_prompts[0] (JSON):",
-              sd.image_prompt);
-          }
-        }
-        if (ev.step === "image_gen2" && sd.image_prompt) {
-          appendStepDetail("image_gen2",
-            "이미지 생성 API 전달 프롬프트 (제품 사진 + 문구):",
-            sd.image_prompt);
-        }
-        if (ev.step === "image_gen_text") {
-          if (sd.text_prompt) {
-            const ta = appendEditableStepDetail("image_gen_text",
-              "글자 제거 프롬프트 (4단계 이미지 + 5단계 OCR 중 4단계 입력 문구와 일치하는 영역 좌표, 편집 가능):",
-              sd.text_prompt);
-            if (stepRows["image_gen_text"]) stepRows["image_gen_text"].promptEdit = ta;
-          }
-        }
-        if (ev.step === "image_diff") {
-        }
-        if (ev.step === "vision_layout") {
-          if (sd.input_image_ref === "image_gen" && lastGeneratedImageB64) {
-            const row = stepRows["vision_layout"];
-            if (row) {
-              row.result.style.display = "block";
-              const lab = document.createElement("div");
-              lab.style.fontWeight = "600";
-              lab.style.marginTop = "6px";
-              lab.textContent =
-                "입력 이미지 (image_gen 단계에서 생성된 PNG) (" +
-                (sd.input_image_width || "?") + "×" +
-                (sd.input_image_height || "?") + " px)";
-              row.result.appendChild(lab);
-            }
-          }
-          if (sd.vision_prompt) {
-            appendStepDetail("vision_layout", "비전 API 전달 프롬프트 (메타 JSON 포함):", sd.vision_prompt);
-          }
-        }
-      } else if (ev.event === "step_done") {
-        finishStep(ev.step, "완료", "done", ev.elapsed, ev.step_elapsed);
-        const d = ev.data || {};
-        if (ev.step === "ocr") {
-          appendStepDetail("ocr", "OCR 결과 (" + (d.ocr_chars || 0) + "자):", previewText(d.ocr_text, 800));
-          const baseFile = (stepInputs.ocr && stepInputs.ocr.file) || ($("file").files && $("file").files[0]);
-          if (baseFile) {
-            stepInputs.gpt = {
-              file: baseFile, filename: baseFile.name,
-              ocr_text: d.ocr_text || "", ui_prompt: $("prompt").value || ""
-            };
-          }
-        } else if (ev.step === "gpt") {
-          if (d.parsed && d.gpt_json) {
-            appendStepDetail("gpt", "GPT JSON 파싱 성공:", JSON.stringify(d.gpt_json, null, 2));
-            const prompts = d.gpt_json && d.gpt_json.image_prompts;
-            allImagePrompts = Array.isArray(prompts) ? prompts : null;
-            const first = (prompts && prompts[0]) || null;
-            if (first) {
-              stepInputs.image_gen = {
-                image_prompt: JSON.stringify(first, null, 2),
-              };
-              stepInputs.image_gen_text = {
-                first: first,
-                image_b64: null,
-                width_px: Number(first.width_px || 860),
-                height_px: Number(first.height_px || 2000),
-              };
-            }
-          } else {
-            appendStepDetail("gpt", "GPT JSON 파싱 실패 — raw 출력:", d.gpt_raw || "");
-          }
-        } else if (ev.step === "image_gen") {
-          const layout = d.layout_json || null;
-          const jsonText = layout
-            ? JSON.stringify(layout, null, 2)
-            : (d.layout_raw || "");
-          const row = stepRows["image_gen"];
-          if (row) {
-            row.result.style.display = "block";
-            appendStepDetail("image_gen",
-              d.parsed ? "문구 정보 JSON:" : "OpenAI 원본 출력 (파싱 실패):",
-              jsonText);
-          }
-          stepInputs.image_gen2 = { layout_json: layout };
-        } else if (ev.step === "image_gen2") {
-          lastGeneratedImageB64 = d.first_image_b64;
-          const row = stepRows["image_gen2"];
-          if (row) {
-            row.result.style.display = "block";
-            const note = document.createElement("div");
-            note.textContent =
-              "이미지 " + (d.first_image_width || "?") + "×" + (d.first_image_height || "?") +
-              " 생성됨.";
-            const thumb = document.createElement("img");
-            thumb.src = "data:image/png;base64," + d.first_image_b64;
-            thumb.style.maxWidth = "540px";
-            thumb.style.marginTop = "6px";
-            thumb.style.border = "1px solid #e5e7eb";
-            thumb.style.borderRadius = "6px";
-            row.result.appendChild(note);
-            row.result.appendChild(thumb);
-          }
-          if (stepInputs.image_gen_text) stepInputs.image_gen_text.image_b64 = d.first_image_b64;
-          stepInputs.image_gen_ocr = { image_b64: d.first_image_b64 };
-        } else if (ev.step === "image_gen_ocr") {
-          appendStepDetail("image_gen_ocr",
-            "상세페이지 이미지(4단계) OCR 라인 (" + (d.line_count || 0) + "개, " + (d.ocr_chars || 0) + "자):",
-            JSON.stringify(d.lines || [], null, 2));
-          // 라인 좌표를 보존: 6단계 글자 제거 프롬프트의 좌표 필터 입력으로 사용
-          if (stepInputs.image_gen_ocr) stepInputs.image_gen_ocr.lines = d.lines || [];
-          else stepInputs.image_gen_ocr = { image_b64: lastGeneratedImageB64, lines: d.lines || [] };
-        } else if (ev.step === "image_gen_text") {
-          lastImageWithTextB64 = d.image_b64;
-          const row = stepRows["image_gen_text"];
-          if (row) {
-            row.result.style.display = "block";
-            const thumb = document.createElement("img");
-            thumb.src = "data:image/png;base64," + d.image_b64;
-            thumb.style.maxWidth = "540px";
-            thumb.style.marginTop = "6px";
-            thumb.style.border = "1px solid #e5e7eb";
-            thumb.style.borderRadius = "6px";
-            row.result.appendChild(thumb);
-          }
-          // 5단계 결과(클린 이미지) 가 6단계(cleaned_ocr) 의 입력
-          stepInputs.cleaned_ocr = { image_b64: d.image_b64 };
-        } else if (ev.step === "cleaned_ocr") {
-          $("vizCard").style.display = "block";
-          $("cleanedOcrTitle").style.display = "block";
-          $("cleanedOcrMeta").style.display = "block";
-          $("cleanedOcrOut").style.display = "block";
-          $("cleanedOcrMeta").textContent =
-            "라인 " + (d.line_count || 0) + "개, 크기 " +
-            (d.image_width || "?") + "×" + (d.image_height || "?") + " px";
-          $("cleanedOcrOut").textContent = JSON.stringify(d.lines || [], null, 2);
-          appendStepDetail("cleaned_ocr",
-            "글자 제거 이미지 OCR 라인 (" + (d.line_count || 0) + "개):",
-            JSON.stringify(d.lines || [], null, 2));
-          // 7단계(text_area_diff) 의 입력: 원본 OCR(3.5단계) vs 클린 OCR(이번 단계)
-          const beforeLines = (stepInputs.image_gen_ocr && stepInputs.image_gen_ocr.lines) ||
-                              (stepInputs.text_area_diff && stepInputs.text_area_diff.before_lines) || [];
-          stepInputs.text_area_diff = {
-            before_lines: beforeLines,
-            after_lines: d.lines || [],
-            iou_threshold: 0.3,
-          };
-        } else if (ev.step === "text_area_diff") {
-          $("vizCard").style.display = "block";
-          $("areaDiffTitle").style.display = "block";
-          $("areaDiffMeta").style.display = "block";
-          $("areaDiffOut").style.display = "block";
-          $("areaDiffMeta").textContent =
-            "사라진 라인 " + (d.line_count || 0) + "개 (IoU < " +
-            (d.iou_threshold != null ? d.iou_threshold : 0.3) + ")";
-          $("areaDiffOut").textContent = JSON.stringify(d.lines || [], null, 2);
-          appendStepDetail("text_area_diff",
-            "사라진 OCR 영역 (" + (d.line_count || 0) + "개):",
-            JSON.stringify(d.lines || [], null, 2));
-          // 8단계(removed_text_overlay) 의 입력
-          if (lastImageWithTextB64) {
-            stepInputs.removed_text_overlay = {
-              base_image_b64: lastImageWithTextB64,
-              lines: d.lines || [],
-            };
-          }
-        } else if (ev.step === "removed_text_overlay") {
-          const base = d.base_image_b64 || lastImageWithTextB64;
-          const lines = d.lines || [];
-          stepInputs.removed_text_overlay = {
-            base_image_b64: base,
-            lines: lines,
-          };
-          // 합성 결과 미리보기는 진행 상황 영역에 두지 않고 오른쪽 패널에 누적
-          addOverlayHistoryEntry(1, base, lines, {
-            width: d.base_image_width,
-            height: d.base_image_height,
-          });
-          const row = stepRows["removed_text_overlay"];
-          if (row) {
-            row.result.style.display = "block";
-            appendStepDetail("removed_text_overlay",
-              "합성 라인 수:", String(d.line_count || lines.length || 0));
-            appendStepDetail("removed_text_overlay",
-              "합성에 사용된 글자 정보 (text/좌표/font_size=5단계 OCR, font_color/style=4단계 이미지 픽셀 샘플링, align=left):",
-              JSON.stringify(lines, null, 2));
-            // 8단계 완료 → 다음 페이지 생성 컨트롤 추가
-            maybeAddNextPageControls(row.result);
-          }
-        } else if (ev.step === "vision_layout") {
-          if (d.parsed && d.layout_json) {
-            appendStepDetail("vision_layout", "문구 좌표 JSON 파싱 성공:",
-              JSON.stringify(d.layout_json, null, 2));
-          } else {
-            appendStepDetail("vision_layout", "문구 좌표 JSON 파싱 실패 — raw 출력:",
-              previewText(d.layout_raw, 700));
-          }
-        }
-      } else if (ev.event === "step_skip") {
-        startStep(ev.step, ev.step, ev.elapsed);
-        finishStep(ev.step, "건너뜀", "skip", ev.elapsed, null, ev.message);
-      } else if (ev.event === "step_error") {
-        if (!stepRows[ev.step]) startStep(ev.step, ev.step, ev.elapsed);
-        finishStep(ev.step, "오류", "error", ev.elapsed, ev.step_elapsed, ev.message);
-      } else if (ev.event === "complete") {
-        appendInfo(
-          "전체 완료 — 총 소요 시간: " + fmtSec(ev.elapsed) +
-          " (상태: " + (ev.status || "ok") + ")",
-          ev.status === "ok" ? "done" : "error"
-        );
-      }
-    }
-
-    async function consumeStream(resp) {
-      if (!resp.ok || !resp.body) {
-        let detail = "HTTP " + resp.status;
-        try {
-          const j = await resp.json();
-          if (j && j.detail) detail += " — " + (typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail));
-        } catch (_) {}
-        appendInfo("요청 실패: " + detail, "error");
-        return;
-      }
-      for await (const ev of readNdjson(resp)) {
-        handleStreamEvent(ev);
-      }
-    }
-
-    function rerunStep(step) {
-      const input = stepInputs[step];
-      if (!input) {
-        appendInfo("재실행 불가: " + step + " 단계의 저장된 입력이 없습니다.", "error");
-        return;
-      }
-      const fd = new FormData();
-      let url = "";
-      // 다음 페이지 4단계(image_gen2__pN) 재실행 — /api/next-page 를 같은 page_index 로 다시 호출.
-      // 페이지 N 의 4~7 단계 행이 그대로 갱신된다.
-      if (input.kind === "next-page") {
-        const pageNum = Number(input.pageNum || 0);
-        const promptIdx = pageNum - 1;
-        const fileEl = $("file");
-        const file = fileEl && fileEl.files && fileEl.files[0];
-        if (!file || !Array.isArray(allImagePrompts) || !allImagePrompts[promptIdx]) {
-          appendInfo("재실행 불가: 원본 사진 또는 image_prompts[" + promptIdx + "] 누락", "error");
-          return;
-        }
-        fd.append("file", file, file.name);
-        fd.append("image_prompt_json", JSON.stringify(allImagePrompts[promptIdx]));
-        fd.append("page_index", String(pageNum));
-        fetch("/api/next-page", { method: "POST", body: fd })
-          .then(consumeStream)
-          .catch((err) => appendInfo("재실행 오류: " + err, "error"));
-        return;
-      }
-      if (step === "ocr") {
-        if (!input.file) return appendInfo("저장된 파일이 없습니다.", "error");
-        fd.append("file", input.file, input.filename || "upload.png");
-        url = "/api/step/ocr";
-      } else if (step === "gpt") {
-        fd.append("file", input.file, input.filename || "upload.png");
-        fd.append("ocr_text", input.ocr_text || "");
-        fd.append("prompt", input.ui_prompt || "");
-        url = "/api/step/gpt";
-      } else if (step === "image_gen") {
-        if (!input.image_prompt) return appendInfo("image_prompts[0] 가 없습니다.", "error");
-        fd.append("image_prompt", input.image_prompt);
-        url = "/api/step/image_gen";
-      } else if (step === "image_gen_ocr") {
-        if (!input.image_b64) return appendInfo("3단계 이미지가 없습니다.", "error");
-        fd.append("image_b64", input.image_b64);
-        url = "/api/step/image_gen_ocr";
-      } else if (step === "image_gen_text") {
-        if (!input.image_b64) return appendInfo("3단계 이미지가 없습니다.", "error");
-        fd.append("image_b64", input.image_b64);
-        fd.append("first_json", JSON.stringify(input.first || {}));
-        fd.append("width_px", String(input.width_px || 860));
-        fd.append("height_px", String(input.height_px || 2000));
-        // 원본 제품 사진도 함께 입력으로 전달
-        const origFile = (stepInputs.ocr && stepInputs.ocr.file) ||
-                         ($("file").files && $("file").files[0]);
-        if (origFile) fd.append("original", origFile, origFile.name);
-        const promptTa = stepRows["image_gen_text"] && stepRows["image_gen_text"].promptEdit;
-        const editedPrompt = promptTa ? promptTa.value : "";
-        if ((editedPrompt || "").trim()) fd.append("prompt", editedPrompt);
-        const modelSel = stepRows["image_gen_text"] && stepRows["image_gen_text"].modelSelect;
-        if (modelSel) {
-          const opt = modelSel.options[modelSel.selectedIndex];
-          const chosenModel = (opt && (opt.dataset.model || "")) || "";
-          const chosenQuality = (opt && (opt.dataset.quality || "")) || "";
-          if (chosenModel.trim()) fd.append("model", chosenModel);
-          if (chosenQuality.trim()) fd.append("quality", chosenQuality);
-        }
-        url = "/api/step/image_gen_text";
-      } else if (step === "cleaned_ocr") {
-        if (!input.image_b64) return appendInfo("글자 제거 이미지가 없습니다.", "error");
-        fd.append("image_b64", input.image_b64);
-        url = "/api/step/cleaned_ocr";
-      } else if (step === "text_area_diff") {
-        fd.append("before_json", JSON.stringify(input.before_lines || []));
-        fd.append("after_json", JSON.stringify(input.after_lines || []));
-        fd.append("iou_threshold", String(input.iou_threshold || 0.3));
-        url = "/api/step/text_area_diff";
-      } else if (step === "removed_text_overlay") {
-        // 항상 최신 6단계(image_gen_text) 결과 이미지를 base 로 사용
-        const baseB64 = lastImageWithTextB64 || input.base_image_b64;
-        if (!baseB64) return appendInfo("글자 제거 이미지가 없습니다.", "error");
-        if (lastImageWithTextB64 && stepInputs.removed_text_overlay) {
-          stepInputs.removed_text_overlay.base_image_b64 = lastImageWithTextB64;
-        }
-        fd.append("base_image_b64", baseB64);
-        fd.append("lines_json", JSON.stringify(input.lines || []));
-        url = "/api/step/removed_text_overlay";
-      } else if (step === "vision_layout") {
-        fd.append("meta_slice", JSON.stringify(input.meta_slice || {}));
-        fd.append("image_b64", input.image_b64);
-        url = "/api/step/vision_layout";
-      } else {
-        return;
-      }
-      fetch(url, { method: "POST", body: fd })
-        .then(consumeStream)
-        .catch((err) => appendInfo("재실행 오류: " + err, "error"));
-    }
-
-    function regenOverlayFromDom() {
-      // 페이지 1 항목의 편집 가능한 오버레이(label-edit-wrap)를 오버레이 히스토리 패널에서 찾는다.
-      const entry = document.getElementById("ohe-p1");
-      const overlayWrap = entry && entry.querySelector(".label-edit-wrap");
-      if (!overlayWrap) {
-        appendInfo("재생성 대상 오버레이를 찾지 못했습니다.", "error");
-        return;
-      }
-      const baseImg = overlayWrap.querySelector("img.label-edit-base");
-      const natW = (baseImg && baseImg.naturalWidth) || 0;
-      const natH = (baseImg && baseImg.naturalHeight) || 0;
-      if (!natW || !natH) {
-        appendInfo("이미지 원본 크기를 확인할 수 없습니다.", "error");
-        return;
-      }
-      const prev = (stepInputs.removed_text_overlay &&
-                    stepInputs.removed_text_overlay.lines) || [];
-      const boxes = overlayWrap.querySelectorAll(".label-edit-box");
-      const updated = [];
-      boxes.forEach((box, idx) => {
-        const src = prev[idx] || {};
-        const leftPct = parseFloat(box.style.left) || 0;
-        const topPct = parseFloat(box.style.top) || 0;
-        const widthPct = parseFloat(box.style.width) || 0;
-        updated.push({
-          ...src,
-          text: box.textContent || "",
-          x: Math.round(leftPct / 100 * natW),
-          y: Math.round(topPct / 100 * natH),
-          width: Math.round(widthPct / 100 * natW) || src.width || 0,
-          height: src.height || 0,
-        });
-      });
-      if (!stepInputs.removed_text_overlay) {
-        appendInfo("이전 합성 입력이 없습니다.", "error");
-        return;
-      }
-      stepInputs.removed_text_overlay = {
-        base_image_b64: stepInputs.removed_text_overlay.base_image_b64,
-        lines: updated,
-      };
-      rerunStep("removed_text_overlay");
-    }
-
-    function appendStepImage(step, label, b64, w, h) {
-      const row = stepRows[step];
-      if (!row || !b64) return;
-      row.result.style.display = "block";
-      const lab = document.createElement("div");
-      lab.style.fontWeight = "600";
-      lab.style.marginTop = "6px";
-      lab.textContent = label + " (" + (w || "?") + "×" + (h || "?") + " px)";
-      const thumb = document.createElement("img");
-      thumb.src = "data:image/png;base64," + b64;
-      thumb.style.maxWidth = "480px";
-      thumb.style.marginTop = "4px";
-      thumb.style.border = "1px solid #e5e7eb";
-      thumb.style.borderRadius = "6px";
-      row.result.appendChild(lab);
-      row.result.appendChild(thumb);
-    }
-
-    function fmtSec(s) {
-      if (s == null || isNaN(s)) return "?";
-      return Number(s).toFixed(2) + "s";
-    }
-
-    function renderPreview(files) {
-      const box = $("previewBox");
-      const fn = $("fileName");
-      if (box) box.innerHTML = "";
-      if (fn) fn.textContent = "";
-      const f = files && files[0];
-      if (!f || !box) return;
-      if (fn) fn.textContent = "선택됨: " + f.name + " (" + Math.round(f.size/1024) + " KB)";
-      const img = document.createElement("img");
-      img.alt = f.name || "preview";
-      box.appendChild(img);
-      try {
-        if (typeof URL !== "undefined" && URL.createObjectURL) {
-          img.src = URL.createObjectURL(f);
-          img.onload = () => { try { URL.revokeObjectURL(img.src); } catch (_) {} };
-        } else { throw new Error("URL.createObjectURL 미지원"); }
-      } catch (_) {
-        const reader = new FileReader();
-        reader.onload = (ev) => { img.src = String(ev.target.result || ""); };
-        reader.readAsDataURL(f);
-      }
-    }
-
-    const fileInput = $("file");
-    if (fileInput) {
-      fileInput.addEventListener("change", (e) => {
-        renderPreview(e.target.files);
-      });
-    } else {
-      console.warn("file input not found at script load");
-    }
-
-    function setupDropzone(dzId, inputId) {
-      const dz = $(dzId);
-      const input = $(inputId);
-      if (!dz || !input) { console.warn("dropzone/input not found", dzId, inputId); return; }
-      const stop = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
-
-      // 클릭은 <label for="file">의 네이티브 동작이 처리. JS는 드래그·드롭만 담당.
-
-      ["dragenter", "dragover"].forEach(t => dz.addEventListener(t, (e) => {
-        stop(e);
-        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
-        dz.classList.add("dragover");
-      }));
-      ["dragleave", "dragend"].forEach(t => dz.addEventListener(t, (e) => {
-        stop(e); dz.classList.remove("dragover");
-      }));
-      dz.addEventListener("drop", (e) => {
-        stop(e); dz.classList.remove("dragover");
-        const dropped = Array.from(e.dataTransfer && e.dataTransfer.files || [])
-          .filter(f => f.type.startsWith("image/"));
-        if (dropped.length === 0) { alert("이미지 파일만 끌어넣어 주세요."); return; }
-        try {
-          const dt = new DataTransfer();
-          dt.items.add(dropped[0]);
-          input.files = dt.files;
-        } catch (_) { /* DataTransfer 미지원 환경 폴백 */ }
-        renderPreview([dropped[0]]);
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      });
-    }
-
-    setupDropzone("productDz", "file");
-    ["dragover", "drop"].forEach(t => window.addEventListener(t, (e) => e.preventDefault()));
-
-    // "글자 영역 테두리 표시" 체크박스 — overlayHistoryBox 에 클래스 토글
-    const toggleBoundsCb = $("toggleTextBounds");
-    if (toggleBoundsCb) {
-      toggleBoundsCb.addEventListener("change", () => {
-        const box = $("overlayHistoryBox");
-        if (!box) return;
-        box.classList.toggle("show-text-bounds", toggleBoundsCb.checked);
-      });
-    }
-
-    const applyBtn = $("applyLabelsBtn");
-    if (applyBtn) {
-      applyBtn.addEventListener("click", () => {
-        const msg = $("applyLabelsMsg");
-        if (!lastGeneratedImageB64) {
-          msg.style.color = "#b91c1c";
-          msg.textContent = "먼저 이미지 생성을 완료해주세요.";
-          return;
-        }
-        const raw = $("layoutOut").value || "";
-        let parsed;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (e) {
-          msg.style.color = "#b91c1c";
-          msg.textContent = "JSON 파싱 오류: " + e.message;
-          return;
-        }
-        const labels = extractLabels(parsed);
-        if (!labels.length) {
-          msg.style.color = "#b91c1c";
-          msg.textContent = "라벨 배열을 찾을 수 없습니다.";
-          return;
-        }
-        renderLabeledCanvas(lastGeneratedImageB64, labels);
-        msg.style.color = "#166534";
-        msg.textContent = labels.length + "개 라벨로 다시 그렸습니다.";
-      });
-    }
-
-    const copyLayoutBtn = $("copyLayoutBtn");
-    if (copyLayoutBtn) {
-      copyLayoutBtn.addEventListener("click", () => {
-        copyToClipboard($("layoutOut").value || "", copyLayoutBtn);
-      });
-    }
-
-    function appendInfo(msg, cls) {
-      const div = document.createElement("div");
-      div.className = "progress-line" + (cls ? " " + cls : "");
-      div.textContent = msg;
-      $("progressBox").appendChild(div);
-      $("progressBox").scrollTop = $("progressBox").scrollHeight;
-      return div;
-    }
-
-    function startStep(step, label, elapsed) {
-      if (stepRows[step]) {
-        const row = stepRows[step];
-        row.line.className = "progress-line running";
-        row.line.querySelector(".badge").textContent = "실행중";
-        row.line.querySelector(".dur").textContent = "";
-        row.line.querySelector("b").textContent = label || step;
-        const btn = row.line.querySelector(".rerun-btn");
-        if (btn) btn.style.display = "none";
-        row.result.innerHTML = "";
-        row.result.style.display = "none";
-        return;
-      }
-      stepCounter += 1;
-      const line = document.createElement("div");
-      line.className = "progress-line running";
-      const isOverlay = step === "removed_text_overlay";
-      line.innerHTML =
-        '<span class="step-num"></span>' +
-        '<span class="badge">실행중</span>' +
-        '<b></b>' +
-        '<span class="dur"></span>' +
-        '<button type="button" class="rerun-btn" style="display:none;margin-left:8px;padding:2px 10px;' +
-        'font-size:11px;border:1px solid #2563eb;background:#fff;color:#2563eb;' +
-        'border-radius:6px;cursor:pointer">재실행</button>' +
-        (isOverlay
-          ? '<button type="button" class="regen-btn" style="display:none;margin-left:6px;padding:2px 10px;' +
-            'font-size:11px;border:0;background:#2563eb;color:#fff;' +
-            'border-radius:6px;cursor:pointer">재생성</button>'
-          : '');
-      line.querySelector(".step-num").textContent = stepCounter + ".";
-      line.querySelector("b").textContent = label || step;
-      const rerunBtn = line.querySelector(".rerun-btn");
-      rerunBtn.addEventListener("click", () => rerunStep(step));
-      if (isOverlay) {
-        const regenBtn = line.querySelector(".regen-btn");
-        regenBtn.addEventListener("click", () => regenOverlayFromDom());
-      }
-      $("progressBox").appendChild(line);
-      const result = document.createElement("div");
-      result.className = "step-result";
-      result.style.display = "none";
-      $("progressBox").appendChild(result);
-      $("progressBox").scrollTop = $("progressBox").scrollHeight;
-      stepRows[step] = { line, result };
-    }
-
-    function setStepResult(step, htmlOrText, isHtml=false) {
-      const row = stepRows[step];
-      if (!row) return;
-      row.result.style.display = "block";
-      if (isHtml) row.result.innerHTML = htmlOrText;
-      else row.result.textContent = htmlOrText;
-    }
-
-    function copyToClipboard(text, btn) {
-      const ok = (msg) => {
-        if (!btn) return;
-        const orig = btn.textContent;
-        btn.textContent = msg || "복사됨";
-        btn.disabled = true;
-        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1200);
-      };
-      const fail = () => ok("복사 실패");
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(String(text == null ? "" : text)).then(() => ok(), fail);
-          return;
-        }
-      } catch (_) { /* fallthrough */ }
-      // 폴백: 임시 textarea + execCommand
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = String(text == null ? "" : text);
-        ta.style.position = "fixed"; ta.style.left = "-1000px"; ta.style.top = "-1000px";
-        document.body.appendChild(ta);
-        ta.select();
-        const done = document.execCommand("copy");
-        document.body.removeChild(ta);
-        if (done) ok(); else fail();
-      } catch (_) { fail(); }
-    }
-
-    function makeCopyBtn(getText) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "copy-btn";
-      btn.textContent = "복사";
-      btn.style.cssText =
-        "margin-left:8px;padding:1px 8px;font-size:11px;border:1px solid #94a3b8;" +
-        "background:#fff;color:#475569;border-radius:5px;cursor:pointer;vertical-align:middle";
-      btn.addEventListener("click", (e) => {
-        e.preventDefault(); e.stopPropagation();
-        copyToClipboard(typeof getText === "function" ? getText() : getText, btn);
-      });
-      return btn;
-    }
-
-    function appendEditableStepDetail(step, label, content) {
-      const row = stepRows[step];
-      if (!row) return null;
-      row.result.style.display = "block";
-      const wrap = document.createElement("div");
-      const lab = document.createElement("div");
-      lab.style.fontWeight = "600";
-      lab.style.marginTop = "6px";
-      lab.style.display = "flex";
-      lab.style.alignItems = "center";
-      lab.style.gap = "4px";
-      const labText = document.createElement("span");
-      labText.textContent = label;
-      lab.appendChild(labText);
-      const ta = document.createElement("textarea");
-      ta.value = String(content == null ? "" : content);
-      ta.style.cssText =
-        "width:100%;min-height:90px;max-height:280px;padding:10px;" +
-        "background:#0f172a;color:#e2e8f0;border:1px solid #1e293b;border-radius:8px;" +
-        "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.5;" +
-        "white-space:pre-wrap;word-break:break-word;resize:vertical;display:block;margin-top:4px";
-      lab.appendChild(makeCopyBtn(() => ta.value));
-      wrap.appendChild(lab);
-      wrap.appendChild(ta);
-      row.result.appendChild(wrap);
-      return ta;
-    }
-
-    function appendStepDetail(step, label, content) {
-      const row = stepRows[step];
-      if (!row) return;
-      row.result.style.display = "block";
-      const wrap = document.createElement("div");
-      const lab = document.createElement("div");
-      lab.style.fontWeight = "600";
-      lab.style.marginTop = "6px";
-      lab.style.display = "flex";
-      lab.style.alignItems = "center";
-      lab.style.gap = "4px";
-      const labText = document.createElement("span");
-      labText.textContent = label;
-      lab.appendChild(labText);
-      const pre = document.createElement("pre");
-      pre.textContent = content;
-      lab.appendChild(makeCopyBtn(() => pre.textContent));
-      wrap.appendChild(lab);
-      wrap.appendChild(pre);
-      row.result.appendChild(wrap);
-    }
-
-    function finishStep(step, badge, cls, elapsed, stepElapsed, message) {
-      const row = stepRows[step];
-      if (!row) {
-        appendInfo("[" + step + "] " + (message || ""), cls);
-        return;
-      }
-      row.line.className = "progress-line " + cls;
-      row.line.querySelector(".badge").textContent = badge;
-      row.line.querySelector(".dur").textContent =
-        stepElapsed != null ? "+" + fmtSec(stepElapsed) : "";
-      const rerunBtn = row.line.querySelector(".rerun-btn");
-      if (rerunBtn) {
-        rerunBtn.style.display = (cls === "done" || cls === "error") && stepInputs[step]
-          ? "inline-block" : "none";
-      }
-      const regenBtn = row.line.querySelector(".regen-btn");
-      if (regenBtn) {
-        regenBtn.style.display = (cls === "done" || cls === "error") && stepInputs[step]
-          ? "inline-block" : "none";
-      }
-      if (message) {
-        const note = document.createElement("div");
-        note.style.marginTop = "4px";
-        note.style.fontSize = "12px";
-        note.textContent = message;
-        row.line.appendChild(note);
-      }
-    }
-
-    function previewText(s, max=600) {
-      if (s == null) return "";
-      const str = String(s);
-      return str.length > max ? str.slice(0, max) + "…(생략)" : str;
-    }
-
-    async function* readNdjson(resp) {
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\\n")) >= 0) {
-          const line = buf.slice(0, idx).trim();
-          buf = buf.slice(idx + 1);
-          if (!line) continue;
-          try { yield JSON.parse(line); }
-          catch (_) { /* ignore malformed line */ }
-        }
-      }
-      const tail = buf.trim();
-      if (tail) {
-        try { yield JSON.parse(tail); } catch (_) {}
-      }
-    }
-
-    $("genForm").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const input = $("file");
-      const files = input.files || [];
-      if (!files.length) { alert("제품 사진을 선택해주세요"); return; }
-
-      const fd = new FormData();
-      fd.append("file", files[0], files[0].name);
-      fd.append("prompt", $("prompt").value || "");
-
-      // 입력 저장: OCR은 사진만, 나머지는 각 단계 완료 후 채워짐
-      stepInputs.ocr = { file: files[0], filename: files[0].name };
-      stepInputs.gpt = null;
-      stepInputs.image_gen = null;
-      stepInputs.image_gen_ocr = null;
-      stepInputs.image_gen_text = null;
-      stepInputs.cleaned_ocr = null;
-      stepInputs.text_area_diff = null;
-      stepInputs.removed_text_overlay = null;
-      stepInputs.vision_layout = null;
-      // 다음 페이지 생성 상태 초기화
-      allImagePrompts = null;
-      nextPageToGen = 2;
-
-      $("progressCard").style.display = "block";
-      $("progressBox").innerHTML = "";
-      // 오버레이 히스토리 패널 초기화 (다음 단계 결과가 들어오면 다시 표시)
-      $("overlayHistoryBox").innerHTML = "";
-      $("overlayHistoryCard").style.display = "none";
-      for (const k of Object.keys(stepRows)) delete stepRows[k];
-      lastGeneratedImageB64 = null;
-      lastImageWithTextB64 = null;
-      stepCounter = 0;
-      $("vizCard").style.display = "none";
-      $("cleanedOcrTitle").style.display = "none";
-      $("cleanedOcrMeta").style.display = "none";
-      $("cleanedOcrOut").style.display = "none";
-      $("cleanedOcrOut").textContent = "";
-      $("areaDiffTitle").style.display = "none";
-      $("areaDiffMeta").style.display = "none";
-      $("areaDiffOut").style.display = "none";
-      $("areaDiffOut").textContent = "";
-      $("labeledTitle").style.display = "none";
-      $("labeledImgWrap").style.display = "none";
-      $("labeledImgWrap").innerHTML = "";
-      $("submitBtn").disabled = true;
-      appendInfo("요청 시작 — 단계별 진행 상황과 소요 시간을 실시간으로 보여줍니다.");
-
-      try {
-        const resp = await fetch("/api/generate", { method: "POST", body: fd });
-        if (!resp.ok || !resp.body) {
-          let detail = "HTTP " + resp.status;
-          try {
-            const j = await resp.json();
-            if (j && j.detail) detail += " — " + (typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail));
-          } catch (_) {}
-          appendInfo("요청 실패: " + detail, "error");
-          $("submitBtn").disabled = false;
-          return;
-        }
-
-        for await (const ev of readNdjson(resp)) {
-          handleStreamEvent(ev);
-        }
-      } catch (err) {
-        appendInfo("스트림 오류: " + err, "error");
-      } finally {
-        $("submitBtn").disabled = false;
-      }
-    });
-  </script>
-</body>
-</html>
-"""
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML)
+    if not _INDEX_HTML_PATH.is_file():
+        raise HTTPException(
+            status_code=500, detail=f"템플릿이 없습니다: {_INDEX_HTML_PATH}"
+        )
+    return HTMLResponse(_INDEX_HTML_PATH.read_text(encoding="utf-8"))
+
+
+# ───────────────────────── 단계별 입출력 로깅 ─────────────────────────
+# 각 요청마다 logs/{timestamp}_{rand}/ 디렉토리가 생성되고, 모든 step_start /
+# step_done / step_error / step_skip / complete 이벤트가 페이지별 JSON 파일로
+# 저장된다. base64 이미지 필드는 .png 로 디코딩되어 별도 파일로 분리되고
+# JSON 안에는 파일 경로만 남는다.
+_LOG_ROOT = Path(__file__).resolve().parent / "logs"
+_CACHE_DIR = Path(__file__).resolve().parent / "cache" / "pre_step6"
+
+
+def _save_pre_step6_cache(
+    product_image_bytes: bytes,
+    product_filename: str,
+    step4_image_b64: str,
+    first_image_width: int,
+    first_image_height: int,
+    step3_ocr_lines: list[dict[str, Any]],
+    step3_ocr_text: str,
+    matched_ocr_lines: list[dict[str, Any]],
+    matched_lines_compact: list[dict[str, Any]],
+    layout_texts: list[str],
+    all_image_prompts: list[dict[str, Any]] | None,
+    image_prompt: dict[str, Any] | None,
+    ui_prompt: str = "",
+    ocr_text: str = "",
+    gpt_json: dict[str, Any] | None = None,
+) -> None:
+    """제품 사진 + 1~5단계 결과를 cache 디렉토리에 저장."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (_CACHE_DIR / "product.png").write_bytes(product_image_bytes)
+        (_CACHE_DIR / "step4_image.png").write_bytes(base64.b64decode(step4_image_b64))
+        meta = {
+            "product_filename": product_filename,
+            "first_image_width": first_image_width,
+            "first_image_height": first_image_height,
+            "step3_ocr_lines": step3_ocr_lines,
+            "step3_ocr_text": step3_ocr_text,
+            "matched_ocr_lines": matched_ocr_lines,
+            "matched_lines_compact": matched_lines_compact,
+            "layout_texts": layout_texts,
+            "all_image_prompts": all_image_prompts or [],
+            "image_prompt": image_prompt,
+            "ui_prompt": ui_prompt,
+            "ocr_text": ocr_text,
+            "gpt_json": gpt_json,
+        }
+        (_CACHE_DIR / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"[cache] 5단계까지 결과 저장됨: {_CACHE_DIR}")
+    except Exception as ex:
+        print(f"[cache] 저장 실패: {ex}")
+
+
+def _load_pre_step6_cache() -> dict[str, Any] | None:
+    """저장된 5단계까지 결과 로드."""
+    meta_path = _CACHE_DIR / "meta.json"
+    product_path = _CACHE_DIR / "product.png"
+    step4_path = _CACHE_DIR / "step4_image.png"
+    if not (meta_path.exists() and product_path.exists() and step4_path.exists()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["product_bytes"] = product_path.read_bytes()
+        meta["step4_image_b64"] = base64.b64encode(step4_path.read_bytes()).decode("ascii")
+        return meta
+    except Exception as ex:
+        print(f"[cache] 로드 실패: {ex}")
+        return None
+
+_session_dir_var: ContextVar[Path | None] = ContextVar(
+    "_session_dir_var", default=None
+)
+_step_counter_var: ContextVar[dict[str, int] | None] = ContextVar(
+    "_step_counter_var", default=None
+)
+
+_B64_IMAGE_KEYS = {
+    "image_b64", "base_image_b64", "first_image_b64", "second_image_b64",
+    "b64_json", "labeled_image_b64", "image_a_b64", "image_b_b64",
+    "diff_image_b64", "overlay_image_b64",
+}
+_LOGGED_EVENTS = {"step_start", "step_done", "step_error", "step_skip", "complete"}
+
+
+def _new_session_dir() -> Path:
+    name = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    d = _LOG_ROOT / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)[:80] or "item"
+
+
+def _decode_b64_to(path: Path, b64: str) -> bool:
+    try:
+        path.write_bytes(base64.b64decode(b64))
+        return True
+    except Exception:
+        return False
+
+
+def _sanitize_for_log(node: Any, out_dir: Path, prefix: str,
+                      counter: list[int]) -> Any:
+    """큰 base64 / 텍스트를 별도 파일로 빼고 JSON에는 경로/요약만 남긴다."""
+    if isinstance(node, dict):
+        result = {}
+        for k, v in node.items():
+            if (k in _B64_IMAGE_KEYS and isinstance(v, str) and len(v) > 200):
+                counter[0] += 1
+                img_name = f"{prefix}__{_safe_name(k)}_{counter[0]}.png"
+                if _decode_b64_to(out_dir / img_name, v):
+                    result[k] = {"_file": img_name, "_b64_len": len(v)}
+                else:
+                    txt_name = img_name + ".b64.txt"
+                    (out_dir / txt_name).write_text(v, encoding="utf-8")
+                    result[k] = {"_file": txt_name, "_b64_len": len(v)}
+            elif isinstance(v, str) and len(v) > 8000:
+                counter[0] += 1
+                txt_name = f"{prefix}__{_safe_name(k)}_{counter[0]}.txt"
+                (out_dir / txt_name).write_text(v, encoding="utf-8")
+                result[k] = {"_file": txt_name, "_len": len(v)}
+            else:
+                result[k] = _sanitize_for_log(v, out_dir, prefix, counter)
+        return result
+    if isinstance(node, list):
+        return [_sanitize_for_log(x, out_dir, prefix, counter) for x in node]
+    return node
+
+
+def _log_event(obj: dict[str, Any]) -> None:
+    sdir = _session_dir_var.get()
+    if sdir is None:
+        return
+    event = obj.get("event")
+    if event not in _LOGGED_EVENTS:
+        return
+    step = str(obj.get("step") or event)
+    page = obj.get("page")
+    if page is None:
+        # data 안에 page 가 들어있는 케이스 (일부 경로)
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else None
+        if data is not None:
+            page = data.get("page")
+    page_label = "common" if page is None else f"page_{page}"
+    page_dir = sdir / page_label
+    page_dir.mkdir(parents=True, exist_ok=True)
+
+    counters = _step_counter_var.get()
+    if counters is None:
+        counters = {}
+        _step_counter_var.set(counters)
+    key = f"{page_label}/{step}/{event}"
+    counters[key] = counters.get(key, 0) + 1
+    seq = counters[key]
+    order = sum(counters.values())  # 전체 순번 (디렉토리 정렬용)
+
+    base = f"{order:03d}_{_safe_name(step)}_{_safe_name(event)}"
+    if seq > 1:
+        base = f"{base}_{seq}"
+    prefix = base
+    sanitized = _sanitize_for_log(obj, page_dir, prefix, [0])
+    try:
+        (page_dir / f"{base}.json").write_text(
+            json.dumps(sanitized, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        # 로그 실패가 메인 스트림을 막지 않도록 swallow
+        pass
 
 
 def _ndjson(obj: dict[str, Any]) -> bytes:
+    try:
+        _log_event(obj)
+    except Exception:
+        pass
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
@@ -2861,11 +2078,28 @@ async def _generate_stream(
     filename: str,
     suffix: str,
     prompt: str,
+    use_cache: bool = False,
 ) -> AsyncIterator[bytes]:
     t_start = time.perf_counter()
 
     def elapsed_total() -> float:
         return round(time.perf_counter() - t_start, 2)
+
+    # 캐시 모드: 1~5단계 결과를 cache 에서 로드
+    cache: dict[str, Any] | None = None
+    if use_cache:
+        cache = _load_pre_step6_cache()
+        if cache is None:
+            yield _ndjson({
+                "event": "step_error", "step": "cache",
+                "elapsed": 0.0,
+                "message": "저장된 5단계 결과가 없습니다. 처음부터 실행해주세요.",
+            })
+            yield _ndjson({"event": "complete", "elapsed": 0.0, "status": "error"})
+            return
+        # 캐시의 제품 사진과 파일명 사용
+        raw = cache.get("product_bytes") or raw
+        filename = cache.get("product_filename") or filename
 
     tmp_path: Path | None = None
     try:
@@ -2877,7 +2111,11 @@ async def _generate_stream(
         # 1) OCR
         yield _ndjson({"event": "step_start", "step": "ocr", "label": "OCR (Document AI)", "elapsed": elapsed_total()})
         t0 = time.perf_counter()
-        ocr_text, ocr_err = await asyncio.to_thread(ocr_image_file, tmp_path)
+        if cache:
+            ocr_text = cache.get("ocr_text", "") or ""
+            ocr_err = None
+        else:
+            ocr_text, ocr_err = await asyncio.to_thread(ocr_image_file, tmp_path)
         step_elapsed = round(time.perf_counter() - t0, 2)
         if ocr_err:
             yield _ndjson({
@@ -2929,9 +2167,13 @@ async def _generate_stream(
         })
         t0 = time.perf_counter()
         try:
-            gpt_raw, gpt_json = await asyncio.to_thread(
-                _chat_sync, user_message, GEMINI_TEXT_MODEL, raw
-            )
+            if cache:
+                gpt_raw = ""
+                gpt_json = cache.get("gpt_json")
+            else:
+                gpt_raw, gpt_json = await asyncio.to_thread(
+                    _chat_sync, user_message, GEMINI_TEXT_MODEL, raw
+                )
         except Exception as e:
             yield _ndjson({
                 "event": "step_error", "step": "gpt",
@@ -2957,10 +2199,16 @@ async def _generate_stream(
                 prompts_all = prompts
 
         if not first or not prompts_all:
+            if not isinstance(gpt_json, dict):
+                reason = "2단계 응답이 JSON 객체로 파싱되지 않아 3단계를 건너뜁니다."
+            elif not isinstance(gpt_json.get("image_prompts"), list):
+                reason = "2단계 JSON 에 image_prompts 배열이 없어 3단계를 건너뜁니다."
+            else:
+                reason = "image_prompts 가 비어 있어 3단계를 건너뜁니다."
             yield _ndjson({
                 "event": "step_skip", "step": "image_gen",
                 "elapsed": elapsed_total(),
-                "message": "image_prompts 가 비어 있어 3단계를 건너뜁니다.",
+                "message": reason,
             })
             yield _ndjson({"event": "complete", "elapsed": elapsed_total(), "status": "ok"})
             return
@@ -2981,9 +2229,13 @@ async def _generate_stream(
         })
         t0 = time.perf_counter()
         try:
-            step3_raw, step3_json = await asyncio.to_thread(
-                _openai_chat_json_sync, api_key, OPENAI_TEXT_MODEL, step3_user_text
-            )
+            if cache:
+                step3_raw = ""
+                step3_json = {"labels": []}
+            else:
+                step3_raw, step3_json = await asyncio.to_thread(
+                    _openai_chat_json_sync, api_key, OPENAI_TEXT_MODEL, step3_user_text
+                )
         except Exception as ex:
             yield _ndjson({
                 "event": "step_error", "step": "image_gen",
@@ -3004,13 +2256,16 @@ async def _generate_stream(
         })
 
         # 3.4) 3단계 결과 JSON 의 문구 + 사용자 제품 사진 → 상세페이지 이미지 생성
-        layout_labels = _extract_layout_labels(step3_json)
-        layout_texts = [
-            lab.get("text", "").strip() for lab in layout_labels
-            if isinstance(lab, dict) and (lab.get("text") or "").strip()
-        ]
-        if not layout_texts and step3_raw:
-            layout_texts = [step3_raw]
+        if cache:
+            layout_texts = cache.get("layout_texts", []) or []
+        else:
+            layout_labels = _extract_layout_labels(step3_json)
+            layout_texts = [
+                lab.get("text", "").strip() for lab in layout_labels
+                if isinstance(lab, dict) and (lab.get("text") or "").strip()
+            ]
+            if not layout_texts and step3_raw:
+                layout_texts = [step3_raw]
         texts_block = "\n".join(f"- {t}" for t in layout_texts)
         image2_prompt_en = (first.get("image2_prompt_en") or "").strip()
         image_gen2_prompt = f"{STEP3_5_IMAGE_GEN_PROMPT}\n{texts_block}".rstrip()
@@ -3028,8 +2283,11 @@ async def _generate_stream(
                 "model": OPENAI_IMAGE_MODEL,
                 "size": gen_size,
                 "quality": image_gen2_quality,
+                "available_options": IMAGE_GEN2_OPTIONS,
                 "image_prompt": image_gen2_prompt,
                 "layout_texts": layout_texts,
+                "width_px": wpx,
+                "height_px": hpx,
             },
         })
         t0 = time.perf_counter()
@@ -3037,13 +2295,18 @@ async def _generate_stream(
         first_image_width: int | None = None
         first_image_height: int | None = None
         try:
-            img_out = await asyncio.to_thread(
-                _images_generate_sync, api_key, image_gen2_prompt, gen_size,
-                raw, filename, OPENAI_IMAGE_MODEL, image_gen2_quality,
-            )
-            first_image_b64 = img_out["b64_json"]
-            first_image_width = int(img_out["output_width"])
-            first_image_height = int(img_out["output_height"])
+            if cache:
+                first_image_b64 = cache["step4_image_b64"]
+                first_image_width = int(cache["first_image_width"])
+                first_image_height = int(cache["first_image_height"])
+            else:
+                img_out = await asyncio.to_thread(
+                    _images_generate_sync, api_key, image_gen2_prompt, gen_size,
+                    raw, filename, OPENAI_IMAGE_MODEL, image_gen2_quality,
+                )
+                first_image_b64 = img_out["b64_json"]
+                first_image_width = int(img_out["output_width"])
+                first_image_height = int(img_out["output_height"])
         except Exception as ex:
             yield _ndjson({
                 "event": "step_error", "step": "image_gen2",
@@ -3074,11 +2337,15 @@ async def _generate_stream(
         step3_ocr_text = ""
         step3_ocr_lines: list[dict[str, Any]] = []
         try:
-            ocr_step3 = await asyncio.to_thread(
-                _ocr_with_positions_sync, base64.b64decode(first_image_b64)
-            )
-            step3_ocr_text = ocr_step3["full_text"]
-            step3_ocr_lines = ocr_step3["lines"]
+            if cache:
+                step3_ocr_text = cache.get("step3_ocr_text", "") or ""
+                step3_ocr_lines = cache.get("step3_ocr_lines", []) or []
+            else:
+                ocr_step3 = await asyncio.to_thread(
+                    _ocr_with_positions_sync, base64.b64decode(first_image_b64)
+                )
+                step3_ocr_text = ocr_step3["full_text"]
+                step3_ocr_lines = ocr_step3["lines"]
         except Exception as ex:
             yield _ndjson({
                 "event": "step_error", "step": "image_gen_ocr",
@@ -3100,30 +2367,89 @@ async def _generate_stream(
         })
 
         # 6) 5단계 OCR 결과 중 4단계 입력 문구(layout_texts) 와 일치하는 라인 좌표만 지우기
-        matched_lines = _match_ocr_to_layout_texts(step3_ocr_lines, layout_texts)
-        # 그룹 매칭(2~4 줄)도 지울 영역은 각 OCR 라인의 좌표를 개별 항목으로 전개
-        matched_ocr_lines = _expand_matched_to_ocr_lines(matched_lines)
-        matched_lines_compact = [
-            {
-                "text": ln.get("text", ""),
-                "x": ln.get("x", 0),
-                "y": ln.get("y", 0),
-                "width": ln.get("width", 0),
-                "height": ln.get("height", 0),
-            }
-            for ln in matched_ocr_lines
-            if isinstance(ln, dict)
-        ]
+        if cache:
+            matched_ocr_lines = cache.get("matched_ocr_lines", []) or []
+            matched_lines_compact = cache.get("matched_lines_compact", []) or []
+        else:
+            matched_lines = _match_ocr_to_layout_texts(step3_ocr_lines, layout_texts)
+            # 그룹 매칭(2~4 줄)도 지울 영역은 각 OCR 라인의 좌표를 개별 항목으로 전개
+            matched_ocr_lines = _expand_matched_to_ocr_lines(matched_lines)
+            matched_lines_compact = [
+                {
+                    "text": ln.get("text", ""),
+                    "x": ln.get("x", 0),
+                    "y": ln.get("y", 0),
+                    "width": ln.get("width", 0),
+                    "height": ln.get("height", 0),
+                }
+                for ln in matched_ocr_lines
+                if isinstance(ln, dict)
+            ]
+
+        # 5단계까지 결과를 cache 디렉토리에 저장 (정상 모드에서만)
+        if not cache:
+            try:
+                _save_pre_step6_cache(
+                    product_image_bytes=raw,
+                    product_filename=filename,
+                    step4_image_b64=first_image_b64,
+                    first_image_width=first_image_width,
+                    first_image_height=first_image_height,
+                    step3_ocr_lines=step3_ocr_lines,
+                    step3_ocr_text=step3_ocr_text,
+                    matched_ocr_lines=matched_ocr_lines,
+                    matched_lines_compact=matched_lines_compact,
+                    layout_texts=layout_texts,
+                    all_image_prompts=prompts_all,
+                    image_prompt=first,
+                    ui_prompt=prompt,
+                    ocr_text=ocr_text,
+                    gpt_json=gpt_json,
+                )
+            except Exception as _cache_ex:
+                print(f"[cache] 저장 호출 실패: {_cache_ex}")
+
         text_prompt = STEP6_TEXT_REMOVE_PROMPT
+        # 지울 영역은 프롬프트가 아니라 마스크 PNG 로 API 에 전달
+        coarse_png_bytes: bytes | None = None
+        coarse_file_path: str | None = None
+        refined_png_bytes: bytes | None = None
+        refined_file_path: str | None = None
+        refine_info: dict[str, Any] = {}
         if matched_lines_compact:
-            text_prompt += (
-                "\n\n[지울 영역 좌표 (이미지 좌상단 원점, 픽셀 단위)]\n"
-                + json.dumps(matched_lines_compact, ensure_ascii=False, indent=2)
+            try:
+                _expanded_rects = _expand_rects_with_margin(
+                    matched_lines_compact, 5, first_image_width, first_image_height
+                )
+                coarse_png_bytes = _build_text_mask_png(
+                    first_image_width, first_image_height, _expanded_rects
+                )
+                coarse_file_path = _save_mask_to_session(
+                    coarse_png_bytes, label="image_gen_text_coarse"
+                )
+            except Exception as ex:
+                print(f"[image_gen_text] 거친 마스크 빌드 실패: {ex}")
+                coarse_png_bytes = None
+            if coarse_png_bytes:
+                refined_png_bytes, refined_file_path, refine_info = _refine_mask_with_logging(
+                    coarse_png_bytes, base64.b64decode(first_image_b64),
+                    label="image_gen_text",
+                )
+        # API 에 전달할 마스크는 coarse (사각) 마스크 — 모델이 약간의 여유 공간을 갖고 배경을 다시 그릴 수 있게
+        mask_png_bytes = coarse_png_bytes
+        # API 입력 이미지: 4단계 이미지의 refined mask 영역을 주변 색으로 미리 메꾼 것
+        step3_bytes_main = base64.b64decode(first_image_b64)
+        api_input_bytes_main = step3_bytes_main
+        inpainted_file_path: str | None = None
+        if refined_png_bytes:
+            api_input_bytes_main, inpainted_file_path = await asyncio.to_thread(
+                _inpaint_and_save, step3_bytes_main, refined_png_bytes,
+                "image_gen_text",
             )
         step4_quality = "medium"
         yield _ndjson({
             "event": "step_start", "step": "image_gen_text",
-            "label": f"글자 제거 이미지 재생성 ({OPENAI_IMAGE_MODEL}, {gen_size}, {step4_quality})",
+            "label": f"글자를 제거한 이미지 생성 ({OPENAI_IMAGE_MODEL}, {gen_size}, {step4_quality})",
             "elapsed": elapsed_total(),
             "data": {
                 "model": OPENAI_IMAGE_MODEL,
@@ -3131,38 +2457,62 @@ async def _generate_stream(
                 "available_options": IMAGE_GEN_TEXT_OPTIONS,
                 "size": gen_size,
                 "text_prompt": text_prompt,
+                "mask_rect_count": len(matched_lines_compact),
+                "mask_rects": matched_lines_compact,
+                "mask_file": coarse_file_path,
+                "refined_mask_file": refined_file_path,
+                "refine_info": refine_info,
+                "inpainted_image_file": inpainted_file_path,
+                "inpainted_image_b64": base64.b64encode(api_input_bytes_main).decode("ascii"),
+                "base_image_b64": first_image_b64,
+                "base_image_width": first_image_width,
+                "base_image_height": first_image_height,
             },
         })
         t0 = time.perf_counter()
         second_image_b64: str | None = None
         second_image_width: int | None = None
         second_image_height: int | None = None
+        stage_images: dict[str, Any] = {}
         try:
-            step3_bytes = base64.b64decode(first_image_b64)
-            extra_for_step4 = [(raw, filename)] if raw else None
-            num_input_imgs = 1 + (len(extra_for_step4) if extra_for_step4 else 0)
-            extra_names = (
-                [n for (_b, n) in extra_for_step4] if extra_for_step4 else []
+            # 마스크 영역만 잘라 API 호출 후 응답을 원본에 다시 붙임
+            cp = await asyncio.to_thread(
+                _crop_paste_api_call,
+                api_key, text_prompt,
+                api_input_bytes_main, mask_png_bytes,
+                OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY,
             )
-            """
-            print("-" * 60)
-            print(
-                f"[image_gen_text] (main) model={OPENAI_IMAGE_MODEL}, "
-                f"quality={OPENAI_IMAGE_QUALITY}, size={gen_size}, "
-                f"input_images={num_input_imgs} (primary=step3.png, extras={extra_names})"
-            )
-            print(f"[image_gen_text] prompt ({len(text_prompt)} chars):")
-            print(text_prompt)
-            print("-" * 60)
-            """
-            img_out_v2 = await asyncio.to_thread(
-                _images_generate_sync, api_key, text_prompt, gen_size,
-                step3_bytes, "step3.png", OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY,
-                extra_for_step4,
-            )
-            second_image_b64 = img_out_v2["b64_json"]
-            second_image_width = int(img_out_v2["output_width"])
-            second_image_height = int(img_out_v2["output_height"])
+            final_bytes = cp["final_bytes"]
+            second_image_b64 = base64.b64encode(final_bytes).decode("ascii")
+            second_image_width = int(cp["final_width"])
+            second_image_height = int(cp["final_height"])
+            stage_images = {
+                "api_input_b64": base64.b64encode(api_input_bytes_main).decode("ascii"),
+                "mask_b64": base64.b64encode(cp["cropped_mask_bytes"]).decode("ascii") if cp.get("cropped_mask_bytes") else (base64.b64encode(mask_png_bytes).decode("ascii") if mask_png_bytes else None),
+                "cropped_sent_b64": base64.b64encode(cp["cropped_input_bytes"]).decode("ascii") if cp["cropped_input_bytes"] else None,
+                "api_response_b64": base64.b64encode(cp["api_response_bytes"]).decode("ascii") if cp["api_response_bytes"] else None,
+                "final_b64": second_image_b64,
+                "bbox": list(cp["bbox"]) if cp["bbox"] else None,
+            }
+            # [DEBUG] 5개 이미지 파일로 저장
+            try:
+                _dbg_dir = _session_dir_var.get() or (_LOG_ROOT / "ad_hoc")
+                _dbg_dir.mkdir(parents=True, exist_ok=True)
+                _dbg_stamp = time.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:4]
+                def _save(name: str, data: bytes | None) -> None:
+                    if not data:
+                        return
+                    p = _dbg_dir / f"image_gen_text__{name}__{_dbg_stamp}.png"
+                    p.write_bytes(data)
+                    print(f"[image_gen_text][DEBUG] {name}: {p}")
+                _save("1_api_input", api_input_bytes_main)
+                _save("2_mask", cp.get("cropped_mask_bytes") or mask_png_bytes)
+                _save("3_cropped_sent", cp["cropped_input_bytes"])
+                _save("4_api_response", cp["api_response_bytes"])
+                _save("5_final", final_bytes)
+                print(f"[image_gen_text][DEBUG] bbox={cp['bbox']}")
+            except Exception as _dbg_ex:
+                print(f"[image_gen_text][DEBUG] 디버그 저장 실패: {_dbg_ex}")
         except Exception as ex:
             yield _ndjson({
                 "event": "step_error", "step": "image_gen_text",
@@ -3172,6 +2522,24 @@ async def _generate_stream(
             yield _ndjson({"event": "complete", "elapsed": elapsed_total(), "status": "error"})
             return
         step_elapsed = round(time.perf_counter() - t0, 2)
+
+        # 5단계 OCR 의 text/좌표/font_size + 4단계 이미지 픽셀에서 샘플링한
+        # font_color/style 로 1차 합성 정보 (overlay_labels) 생성
+        # (step_done 직전에 계산하여 6단계 결과에 "다듬기 전 정보 preview" 를 포함)
+        sampled_lines = await asyncio.to_thread(
+            _apply_pixel_styles_to_lines,
+            base64.b64decode(first_image_b64),
+            matched_ocr_lines,
+        )
+        overlay_labels = []
+        for ln in sampled_lines:
+            if not isinstance(ln, dict):
+                continue
+            cleaned = _strip_leading_bullet(ln.get("text"))
+            if not (isinstance(cleaned, str) and cleaned.strip()):
+                continue
+            overlay_labels.append({**ln, "align": "center", "text": cleaned})
+
         yield _ndjson({
             "event": "step_done", "step": "image_gen_text",
             "elapsed": elapsed_total(), "step_elapsed": step_elapsed,
@@ -3179,29 +2547,73 @@ async def _generate_stream(
                 "image_b64": second_image_b64,
                 "image_width": second_image_width,
                 "image_height": second_image_height,
+                "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
+                "stage_images": stage_images,
             },
         })
 
-        # 9) 글자 제거 이미지 위에 합성: 5단계 OCR 의 text/좌표/font_size 사용,
-        #    글자색 + bold 여부는 4단계 이미지의 OCR 영역 픽셀에서 추출
-        sampled_lines = await asyncio.to_thread(
-            _apply_pixel_styles_to_lines,
-            base64.b64decode(first_image_b64),
-            matched_ocr_lines,
-        )
-        overlay_labels = [
-            {**ln, "align": "left"}
-            for ln in sampled_lines
-            if isinstance(ln, dict)
-        ]
+        # 7단계: GPT 비전에 글자 제거 이미지 + 1차 합성 정보를 보내
+        #        위치/색을 다듬어진 정보로 받기
+        refined_labels = overlay_labels
+        refine_raw = ""
+        refine_prompt = ""
+        yield _ndjson({
+            "event": "step_start", "step": "overlay_refine",
+            "label": f"합성 정보 다듬기 ({OPENAI_VISION_MODEL}) — 글자 제거 이미지 + 현재 라인",
+            "elapsed": elapsed_total(),
+            "data": {
+                "model": OPENAI_VISION_MODEL,
+                "reasoning_effort": OVERLAY_REFINE_DEFAULT_EFFORT,
+                "available_options": OVERLAY_REFINE_OPTIONS,
+                "input_line_count": len(overlay_labels),
+                "input_lines": overlay_labels,
+            },
+        })
+        t0 = time.perf_counter()
+        try:
+            refined_labels, refine_prompt, refine_raw = await asyncio.to_thread(
+                _refine_overlay_layout_sync,
+                api_key, OPENAI_VISION_MODEL, second_image_b64, overlay_labels,
+                second_image_width, second_image_height,
+                OVERLAY_REFINE_DEFAULT_EFFORT,
+            )
+        except Exception as ex:
+            yield _ndjson({
+                "event": "step_error", "step": "overlay_refine",
+                "elapsed": elapsed_total(),
+                "step_elapsed": round(time.perf_counter() - t0, 2),
+                "message": str(ex),
+            })
+            # 다듬기 실패해도 합성 단계는 1차 정보로 진행
+            refined_labels = overlay_labels
+        step_elapsed = round(time.perf_counter() - t0, 2)
+        yield _ndjson({
+            "event": "step_done", "step": "overlay_refine",
+            "elapsed": elapsed_total(), "step_elapsed": step_elapsed,
+            "data": {
+                "lines": refined_labels,
+                "line_count": len(refined_labels),
+                "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
+                "refine_prompt": refine_prompt,
+                "refine_raw": refine_raw,
+            },
+        })
+
+        # 8단계: 다듬어진 합성 정보로 글자 제거 이미지에 글자 합성 (canvas)
         yield _ndjson({
             "event": "step_start", "step": "removed_text_overlay",
-            "label": "글자 제거 이미지에 글자 합성 (canvas) — 전부 5단계 OCR 정보 사용",
+            "label": "글자 제거 이미지에 글자 합성 (canvas) — 7단계에서 다듬어진 정보 사용",
             "elapsed": elapsed_total(),
             "data": {
                 "base_image_ref": "image_gen_text",
-                "lines_ref": "image_gen_ocr",
-                "line_count": len(overlay_labels),
+                "lines_ref": "overlay_refine",
+                "line_count": len(refined_labels),
             },
         })
         yield _ndjson({
@@ -3211,8 +2623,8 @@ async def _generate_stream(
                 "base_image_b64": second_image_b64,
                 "base_image_width": second_image_width,
                 "base_image_height": second_image_height,
-                "lines": overlay_labels,
-                "line_count": len(overlay_labels),
+                "lines": refined_labels,
+                "line_count": len(refined_labels),
             },
         })
 
@@ -3229,6 +2641,7 @@ async def _generate_stream(
 async def api_generate(
     file: UploadFile = File(...),
     prompt: str = Form(""),
+    use_cache: str = Form(""),
 ) -> StreamingResponse:
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드할 수 있습니다.")
@@ -3247,18 +2660,39 @@ async def api_generate(
     if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
         suffix = ".png"
 
-    return StreamingResponse(
-        _generate_stream(raw, file.filename or "upload", suffix, prompt),
-        media_type="application/x-ndjson",
-        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    use_cache_bool = str(use_cache).strip().lower() in ("1", "true", "yes", "on")
+    return _stream_response(
+        _generate_stream(raw, file.filename or "upload", suffix, prompt, use_cache_bool)
     )
 
 
 def _stream_response(gen: AsyncIterator[bytes]) -> StreamingResponse:
+    sdir = _new_session_dir()
+
+    async def _wrapped() -> AsyncIterator[bytes]:
+        token_dir = _session_dir_var.set(sdir)
+        token_cnt = _step_counter_var.set({})
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            try:
+                _session_dir_var.reset(token_dir)
+            except Exception:
+                pass
+            try:
+                _step_counter_var.reset(token_cnt)
+            except Exception:
+                pass
+
     return StreamingResponse(
-        gen,
+        _wrapped(),
         media_type="application/x-ndjson",
-        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "X-Session-Dir": sdir.name,
+        },
     )
 
 
@@ -3467,6 +2901,83 @@ async def api_step_image_gen_ocr(request: Request) -> StreamingResponse:
     return _stream_response(gen())
 
 
+@app.post("/api/step/image_gen2")
+async def api_step_image_gen2(request: Request) -> StreamingResponse:
+    """4단계 (image_gen2) 재실행. 원본 제품 사진 + image_prompt + 모델/품질 선택값으로 한 장 생성."""
+    form = await _parse_big_form(request)
+    file = form.get("file")
+    if file is None or not hasattr(file, "read"):
+        raise HTTPException(status_code=400, detail="제품 사진(file) 누락")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="제품 사진이 비어 있습니다.")
+    filename = getattr(file, "filename", None) or "upload.png"
+    image_prompt = str(form.get("image_prompt") or "")
+    if not image_prompt:
+        raise HTTPException(status_code=400, detail="image_prompt 가 비어 있습니다.")
+    try:
+        width_px = int(form.get("width_px") or 860)
+        height_px = int(form.get("height_px") or 2000)
+    except (ValueError, TypeError):
+        width_px, height_px = 860, 2000
+    model_arg = (str(form.get("model") or "")).strip()
+    quality_arg = (str(form.get("quality") or "")).strip()
+
+    async def gen() -> AsyncIterator[bytes]:
+        t_start = time.perf_counter()
+        api_key = _openai_api_key()
+        if not api_key:
+            yield _ndjson({"event": "step_error", "step": "image_gen2",
+                           "elapsed": 0.0,
+                           "message": "OPENAI_API_KEY 가 config.py 또는 환경 변수에 없습니다."})
+            yield _ndjson({"event": "complete", "elapsed": 0.0, "status": "error"})
+            return
+        gen_size = choose_api_size(width_px, height_px)
+        use_model = model_arg or OPENAI_IMAGE_MODEL
+        use_quality = quality_arg or "low"
+        yield _ndjson({
+            "event": "step_start", "step": "image_gen2",
+            "label": f"상세페이지 이미지 생성 ({use_model}, {gen_size}, {use_quality})",
+            "elapsed": 0.0,
+            "data": {
+                "model": use_model,
+                "size": gen_size,
+                "quality": use_quality,
+                "available_options": IMAGE_GEN2_OPTIONS,
+                "image_prompt": image_prompt,
+                "width_px": width_px,
+                "height_px": height_px,
+            },
+        })
+        t0 = time.perf_counter()
+        try:
+            img_out = await asyncio.to_thread(
+                _images_generate_sync, api_key, image_prompt, gen_size,
+                raw, filename, use_model, use_quality,
+            )
+        except Exception as ex:
+            total = round(time.perf_counter() - t_start, 2)
+            yield _ndjson({"event": "step_error", "step": "image_gen2",
+                           "elapsed": total, "step_elapsed": round(time.perf_counter() - t0, 2),
+                           "message": str(ex)})
+            yield _ndjson({"event": "complete", "elapsed": total, "status": "error"})
+            return
+        step_elapsed = round(time.perf_counter() - t0, 2)
+        total = round(time.perf_counter() - t_start, 2)
+        yield _ndjson({
+            "event": "step_done", "step": "image_gen2",
+            "elapsed": total, "step_elapsed": step_elapsed,
+            "data": {
+                "first_image_b64": img_out["b64_json"],
+                "first_image_width": int(img_out["output_width"]),
+                "first_image_height": int(img_out["output_height"]),
+            },
+        })
+        yield _ndjson({"event": "complete", "elapsed": total, "status": "ok"})
+
+    return _stream_response(gen())
+
+
 @app.post("/api/step/image_gen_text")
 async def api_step_image_gen_text(request: Request) -> StreamingResponse:
     form = await _parse_big_form(request)
@@ -3482,40 +2993,87 @@ async def api_step_image_gen_text(request: Request) -> StreamingResponse:
     prompt = str(form.get("prompt") or "")
     model = str(form.get("model") or "")
     quality_arg = str(form.get("quality") or "")
-    # 원본 제품 이미지 (선택). form field "original" (UploadFile) 또는 "original_b64" (base64 문자열)
-    extra_imgs: list[tuple[bytes, str]] = []
-    orig_uf = form.get("original")
-    if orig_uf is not None and hasattr(orig_uf, "read"):
+    # 페이지 N (2 이상) 재실행 지원: step_suffix="__pN" 이 오면 응답 step 이름에 붙임
+    step_suffix = str(form.get("step_suffix") or "")
+    try:
+        page_num_arg: int | None = int(form.get("page") or 0) or None
+    except (ValueError, TypeError):
+        page_num_arg = None
+    step_name = "image_gen_text" + step_suffix
+    page_kw = {"page": page_num_arg} if page_num_arg else {}
+    # 마스크용 사각형 좌표 (JSON). 없으면 마스크 없이 호출.
+    mask_rects_json = str(form.get("mask_rects_json") or "")
+    mask_rects: list[dict[str, Any]] = []
+    if mask_rects_json:
         try:
-            orig_bytes = await orig_uf.read()
-            if orig_bytes:
-                extra_imgs.append((orig_bytes, getattr(orig_uf, "filename", None) or "original.png"))
-        except Exception:
-            pass
-    if not extra_imgs:
-        orig_b64 = str(form.get("original_b64") or "")
-        if orig_b64:
-            try:
-                extra_imgs.append((base64.b64decode(orig_b64), "original.png"))
-            except Exception:
-                pass
+            parsed_rects = json.loads(mask_rects_json)
+            if isinstance(parsed_rects, list):
+                mask_rects = [r for r in parsed_rects if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            mask_rects = []
+    # 6단계 글자 제거는 원본 제품 사진을 첨부하지 않는다 (마스크로 영역만 지정)
 
     async def gen() -> AsyncIterator[bytes]:
         t_start = time.perf_counter()
         api_key = _openai_api_key()
         if not api_key:
-            yield _ndjson({"event": "step_error", "step": "image_gen_text",
+            yield _ndjson({"event": "step_error", "step": step_name,
                            "elapsed": 0.0,
-                           "message": "OPENAI_API_KEY 가 config.py 또는 환경 변수에 없습니다."})
-            yield _ndjson({"event": "complete", "elapsed": 0.0, "status": "error"})
+                           "message": "OPENAI_API_KEY 가 config.py 또는 환경 변수에 없습니다.",
+                           **page_kw})
+            yield _ndjson({"event": "complete", "elapsed": 0.0, "status": "error",
+                           **page_kw})
             return
         gen_size = choose_api_size(width_px, height_px)
         text_prompt = (prompt or "").strip() or STEP6_TEXT_REMOVE_PROMPT
         use_model = (model or "").strip() or OPENAI_IMAGE_MODEL
         use_quality = (quality_arg or "").strip() or "medium"
+        # 마스크 빌드: step3 이미지의 실제 해상도로 만들어야 함
+        step3_bytes = base64.b64decode(image_b64)
+        try:
+            with Image.open(BytesIO(step3_bytes)) as _im:
+                src_w, src_h = _im.size
+        except Exception:
+            src_w, src_h = width_px, height_px
+        coarse_png_bytes: bytes | None = None
+        coarse_file_path: str | None = None
+        refined_png_bytes: bytes | None = None
+        refined_file_path: str | None = None
+        refine_info: dict[str, Any] = {}
+        if mask_rects:
+            try:
+                _expanded_rects = _expand_rects_with_margin(mask_rects, 5, src_w, src_h)
+                coarse_png_bytes = _build_text_mask_png(src_w, src_h, _expanded_rects)
+                mask_label = f"image_gen_text_rerun{step_suffix}_coarse" if step_suffix \
+                    else "image_gen_text_rerun_coarse"
+                coarse_file_path = _save_mask_to_session(
+                    coarse_png_bytes, label=mask_label, page=page_num_arg
+                )
+            except Exception as ex:
+                print(f"[image_gen_text rerun{step_suffix}] 거친 마스크 빌드 실패: {ex}")
+                coarse_png_bytes = None
+            if coarse_png_bytes:
+                refine_label = f"image_gen_text_rerun{step_suffix}" if step_suffix \
+                    else "image_gen_text_rerun"
+                refined_png_bytes, refined_file_path, refine_info = _refine_mask_with_logging(
+                    coarse_png_bytes, step3_bytes,
+                    label=refine_label, page=page_num_arg,
+                )
+        # API 에 전달할 마스크는 coarse (사각) 마스크
+        mask_png_bytes = coarse_png_bytes
+        # API 입력 이미지: refined mask 영역을 주변 색으로 메꾼 step3 이미지
+        api_input_bytes_rerun = step3_bytes
+        inpainted_file_path: str | None = None
+        if refined_png_bytes:
+            inp_label = f"image_gen_text_rerun{step_suffix}" if step_suffix \
+                else "image_gen_text_rerun"
+            api_input_bytes_rerun, inpainted_file_path = await asyncio.to_thread(
+                _inpaint_and_save, step3_bytes, refined_png_bytes,
+                inp_label, page_num_arg,
+            )
         yield _ndjson({
-            "event": "step_start", "step": "image_gen_text",
-            "label": f"글자 제거 이미지 재생성 ({use_model}, {gen_size}, {use_quality})",
+            "event": "step_start", "step": step_name,
+            "label": f"글자를 제거한 이미지 생성 ({use_model}, {gen_size}, {use_quality})",
             "elapsed": 0.0,
             "data": {
                 "model": use_model,
@@ -3523,44 +3081,89 @@ async def api_step_image_gen_text(request: Request) -> StreamingResponse:
                 "available_options": IMAGE_GEN_TEXT_OPTIONS,
                 "size": gen_size,
                 "text_prompt": text_prompt,
+                "mask_rect_count": len(mask_rects),
+                "mask_rects": mask_rects,
+                "mask_file": coarse_file_path,
+                "refined_mask_file": refined_file_path,
+                "refine_info": refine_info,
+                "inpainted_image_file": inpainted_file_path,
+                "inpainted_image_b64": base64.b64encode(api_input_bytes_rerun).decode("ascii"),
+                "base_image_b64": image_b64,
+                "base_image_width": src_w,
+                "base_image_height": src_h,
             },
+            **page_kw,
         })
         t0 = time.perf_counter()
         try:
-            step3_bytes = base64.b64decode(image_b64)
-            num_input_imgs = 1 + (len(extra_imgs) if extra_imgs else 0)
-            extra_names = [n for (_b, n) in extra_imgs] if extra_imgs else []
             print("-" * 60)
             print(
-                f"[image_gen_text] (rerun) model={use_model}, "
+                f"[image_gen_text] (rerun{step_suffix}) model={use_model}, "
                 f"quality={use_quality}, size={gen_size}, "
-                f"input_images={num_input_imgs} (primary=step3.png, extras={extra_names})"
+                f"input_images=1 (primary=step3_inpainted.png), "
+                f"mask_rects={len(mask_rects)}"
             )
             print(f"[image_gen_text] prompt ({len(text_prompt)} chars):")
             print(text_prompt)
             print("-" * 60)
-            img_out_v2 = await asyncio.to_thread(
-                _images_generate_sync, api_key, text_prompt, gen_size,
-                step3_bytes, "step3.png", use_model, use_quality,
-                extra_imgs or None,
+            cp = await asyncio.to_thread(
+                _crop_paste_api_call,
+                api_key, text_prompt,
+                api_input_bytes_rerun, mask_png_bytes,
+                use_model, use_quality,
             )
         except Exception as ex:
             total = round(time.perf_counter() - t_start, 2)
-            yield _ndjson({"event": "step_error", "step": "image_gen_text",
+            yield _ndjson({"event": "step_error", "step": step_name,
                            "elapsed": total, "step_elapsed": round(time.perf_counter() - t0, 2),
-                           "message": str(ex)})
-            yield _ndjson({"event": "complete", "elapsed": total, "status": "error"})
+                           "message": str(ex), **page_kw})
+            yield _ndjson({"event": "complete", "elapsed": total, "status": "error",
+                           **page_kw})
             return
+        final_bytes = cp["final_bytes"]
+        final_b64 = base64.b64encode(final_bytes).decode("ascii")
+        final_w = int(cp["final_width"])
+        final_h = int(cp["final_height"])
+        # [DEBUG] 5개 이미지 파일로 저장
+        try:
+            _dbg_dir = _session_dir_var.get() or (_LOG_ROOT / "ad_hoc")
+            _dbg_dir.mkdir(parents=True, exist_ok=True)
+            _dbg_stamp = time.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:4]
+            def _save(name: str, data: bytes | None) -> None:
+                if not data:
+                    return
+                p = _dbg_dir / f"{step_name}__{name}__{_dbg_stamp}.png"
+                p.write_bytes(data)
+                print(f"[{step_name}][DEBUG] {name}: {p}")
+            _save("1_api_input", api_input_bytes_rerun)
+            _save("2_mask", mask_png_bytes)
+            _save("3_cropped_sent", cp["cropped_input_bytes"])
+            _save("4_api_response", cp["api_response_bytes"])
+            _save("5_final", final_bytes)
+            print(f"[{step_name}][DEBUG] bbox={cp['bbox']}")
+        except Exception as _dbg_ex:
+            print(f"[{step_name}][DEBUG] 디버그 저장 실패: {_dbg_ex}")
+        stage_images_rerun = {
+            "api_input_b64": base64.b64encode(api_input_bytes_rerun).decode("ascii"),
+            "mask_b64": base64.b64encode(cp["cropped_mask_bytes"]).decode("ascii") if cp.get("cropped_mask_bytes") else (base64.b64encode(mask_png_bytes).decode("ascii") if mask_png_bytes else None),
+            "cropped_sent_b64": base64.b64encode(cp["cropped_input_bytes"]).decode("ascii") if cp["cropped_input_bytes"] else None,
+            "api_response_b64": base64.b64encode(cp["api_response_bytes"]).decode("ascii") if cp["api_response_bytes"] else None,
+            "final_b64": final_b64,
+            "bbox": list(cp["bbox"]) if cp["bbox"] else None,
+        }
         step_elapsed = round(time.perf_counter() - t0, 2)
         total = round(time.perf_counter() - t_start, 2)
-        yield _ndjson({"event": "step_done", "step": "image_gen_text",
+        yield _ndjson({"event": "step_done", "step": step_name,
                        "elapsed": total, "step_elapsed": step_elapsed,
                        "data": {
-                           "image_b64": img_out_v2["b64_json"],
-                           "image_width": int(img_out_v2["output_width"]),
-                           "image_height": int(img_out_v2["output_height"]),
-                       }})
-        yield _ndjson({"event": "complete", "elapsed": total, "status": "ok"})
+                           "image_b64": final_b64,
+                           "image_width": final_w,
+                           "image_height": final_h,
+                           "stage_images": stage_images_rerun,
+                       },
+                       **page_kw})
+        yield _ndjson({"event": "complete", "elapsed": total, "status": "ok",
+                       **page_kw})
 
     return _stream_response(gen())
 
@@ -3705,6 +3308,106 @@ async def api_step_removed_text_overlay(request: Request) -> StreamingResponse:
     return _stream_response(gen())
 
 
+@app.post("/api/step/overlay_refine")
+async def api_step_overlay_refine(request: Request) -> StreamingResponse:
+    """7단계 (합성 정보 다듬기) 재실행. base_image_b64 + lines_json + (width/height) 을 받아
+    GPT 비전에 보내 다듬어진 lines 를 반환한다. step_suffix 가 있으면 응답의 step 이름에
+    그대로 붙여 추가 페이지(__pN) 도 같은 페이지 그룹 UI 에 갱신된다."""
+    form = await _parse_big_form(request)
+    base_image_b64 = str(form.get("base_image_b64") or "")
+    lines_json = str(form.get("lines_json") or "[]")
+    step_suffix = str(form.get("step_suffix") or "")
+    chosen_model = (str(form.get("model") or "").strip()
+                    or OPENAI_VISION_MODEL)
+    chosen_effort = (str(form.get("reasoning_effort") or "").strip()
+                     or OVERLAY_REFINE_DEFAULT_EFFORT)
+    try:
+        page_num = int(form.get("page") or 0) or None
+    except (ValueError, TypeError):
+        page_num = None
+    try:
+        width = int(form.get("width") or 0) or None
+    except (ValueError, TypeError):
+        width = None
+    try:
+        height = int(form.get("height") or 0) or None
+    except (ValueError, TypeError):
+        height = None
+    if not base_image_b64:
+        raise HTTPException(status_code=400, detail="base_image_b64 가 비어 있습니다.")
+    try:
+        lines = json.loads(lines_json)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"lines_json 파싱 오류: {e}") from e
+    if not isinstance(lines, list):
+        raise HTTPException(status_code=400, detail="lines 는 배열이어야 합니다.")
+    step_name = f"overlay_refine{step_suffix}"
+
+    async def gen() -> AsyncIterator[bytes]:
+        t_start = time.perf_counter()
+        api_key = _openai_api_key()
+        if not api_key:
+            yield _ndjson({
+                "event": "step_error", "step": step_name,
+                "elapsed": 0.0,
+                "message": "OPENAI_API_KEY 가 config.py 또는 환경 변수에 없습니다.",
+                **({"page": page_num} if page_num else {}),
+            })
+            yield _ndjson({"event": "complete", "elapsed": 0.0, "status": "error"})
+            return
+        yield _ndjson({
+            "event": "step_start", "step": step_name,
+            "label": f"합성 정보 다듬기 ({chosen_model}, reasoning: {chosen_effort}) — 재실행",
+            "elapsed": 0.0,
+            "data": {
+                "model": chosen_model,
+                "reasoning_effort": chosen_effort,
+                "available_options": OVERLAY_REFINE_OPTIONS,
+                "input_line_count": len(lines),
+                "input_lines": lines,
+            },
+            **({"page": page_num} if page_num else {}),
+        })
+        t0 = time.perf_counter()
+        try:
+            refined, prompt, raw = await asyncio.to_thread(
+                _refine_overlay_layout_sync,
+                api_key, chosen_model, base_image_b64, lines, width, height,
+                chosen_effort,
+            )
+        except Exception as ex:
+            total = round(time.perf_counter() - t_start, 2)
+            yield _ndjson({
+                "event": "step_error", "step": step_name,
+                "elapsed": total,
+                "step_elapsed": round(time.perf_counter() - t0, 2),
+                "message": str(ex),
+                **({"page": page_num} if page_num else {}),
+            })
+            yield _ndjson({"event": "complete", "elapsed": total, "status": "error"})
+            return
+        step_elapsed = round(time.perf_counter() - t0, 2)
+        total = round(time.perf_counter() - t_start, 2)
+        yield _ndjson({
+            "event": "step_done", "step": step_name,
+            "elapsed": total, "step_elapsed": step_elapsed,
+            "data": {
+                "lines": refined,
+                "line_count": len(refined),
+                "input_lines": lines,
+                "base_image_b64": base_image_b64,
+                "base_image_width": width,
+                "base_image_height": height,
+                "refine_prompt": prompt,
+                "refine_raw": raw,
+            },
+            **({"page": page_num} if page_num else {}),
+        })
+        yield _ndjson({"event": "complete", "elapsed": total, "status": "ok"})
+
+    return _stream_response(gen())
+
+
 @app.post("/api/next-page")
 async def api_next_page(request: Request) -> StreamingResponse:
     """추가 페이지 한 장에 대해 4~7단계(상세이미지 생성 → OCR → 글자 제거 → 글자 합성)를 수행."""
@@ -3729,6 +3432,10 @@ async def api_next_page(request: Request) -> StreamingResponse:
             raise ValueError("image_prompt 가 객체(dict)가 아닙니다.")
     except (json.JSONDecodeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=f"image_prompt_json 파싱 오류: {e}") from e
+
+    # 4단계 image_gen2 의 모델/품질 선택값 (없으면 기본값)
+    image_gen2_model_arg = (str(form.get("image_gen2_model") or "")).strip()
+    image_gen2_quality_arg = (str(form.get("image_gen2_quality") or "")).strip()
 
     sx = f"__p{page_index}"
 
@@ -3786,23 +3493,28 @@ async def api_next_page(request: Request) -> StreamingResponse:
         wpx = int(first.get("width_px") or 860)
         hpx = int(first.get("height_px") or 2000)
         gen_size = choose_api_size(wpx, hpx)
-        image_gen2_quality = "low"
+        image_gen2_model_use = image_gen2_model_arg or OPENAI_IMAGE_MODEL
+        image_gen2_quality = image_gen2_quality_arg or "low"
         yield _ndjson({
             "event": "step_start", "step": f"image_gen2{sx}",
-            "label": f"페이지 {page_index} · 4단계 — 상세페이지 이미지 생성 ({OPENAI_IMAGE_MODEL}, {gen_size}, {image_gen2_quality})",
+            "label": f"페이지 {page_index} · 4단계 — 상세페이지 이미지 생성 ({image_gen2_model_use}, {gen_size}, {image_gen2_quality})",
             "elapsed": elapsed_total(),
             "page": page_index,
             "data": {
-                "model": OPENAI_IMAGE_MODEL, "size": gen_size,
-                "quality": image_gen2_quality, "layout_texts": layout_texts,
+                "model": image_gen2_model_use, "size": gen_size,
+                "quality": image_gen2_quality,
+                "available_options": IMAGE_GEN2_OPTIONS,
+                "layout_texts": layout_texts,
                 "image_prompt": image_gen2_prompt,
+                "width_px": wpx,
+                "height_px": hpx,
             },
         })
         t0 = time.perf_counter()
         try:
             img_out = await asyncio.to_thread(
                 _images_generate_sync, api_key, image_gen2_prompt, gen_size,
-                raw, filename, OPENAI_IMAGE_MODEL, image_gen2_quality,
+                raw, filename, image_gen2_model_use, image_gen2_quality,
             )
             first_image_b64 = img_out["b64_json"]
             first_image_width = int(img_out["output_width"])
@@ -3878,29 +3590,109 @@ async def api_next_page(request: Request) -> StreamingResponse:
             if isinstance(ln, dict)
         ]
         text_prompt = STEP6_TEXT_REMOVE_PROMPT
+        # 지울 영역은 프롬프트가 아니라 마스크 PNG 로 API 에 전달
+        coarse_png_bytes: bytes | None = None
+        coarse_file_path: str | None = None
+        refined_png_bytes: bytes | None = None
+        refined_file_path: str | None = None
+        refine_info: dict[str, Any] = {}
         if matched_lines_compact:
-            text_prompt += (
-                "\n\n[지울 영역 좌표 (이미지 좌상단 원점, 픽셀 단위)]\n"
-                + json.dumps(matched_lines_compact, ensure_ascii=False, indent=2)
+            try:
+                _expanded_rects = _expand_rects_with_margin(
+                    matched_lines_compact, 5, first_image_width, first_image_height
+                )
+                coarse_png_bytes = _build_text_mask_png(
+                    first_image_width, first_image_height, _expanded_rects
+                )
+                coarse_file_path = _save_mask_to_session(
+                    coarse_png_bytes,
+                    label=f"image_gen_text_p{page_index}_coarse",
+                    page=page_index,
+                )
+            except Exception as ex:
+                print(f"[image_gen_text page] 거친 마스크 빌드 실패: {ex}")
+                coarse_png_bytes = None
+            if coarse_png_bytes:
+                refined_png_bytes, refined_file_path, refine_info = _refine_mask_with_logging(
+                    coarse_png_bytes, base64.b64decode(first_image_b64),
+                    label=f"image_gen_text_p{page_index}", page=page_index,
+                )
+        # API 에 전달할 마스크는 coarse (사각) 마스크
+        mask_png_bytes = coarse_png_bytes
+        # API 입력 이미지: refined mask 영역을 주변 색으로 메꾼 4단계 이미지
+        step3_bytes_page = base64.b64decode(first_image_b64)
+        api_input_bytes_page = step3_bytes_page
+        inpainted_file_path: str | None = None
+        if refined_png_bytes:
+            api_input_bytes_page, inpainted_file_path = await asyncio.to_thread(
+                _inpaint_and_save, step3_bytes_page, refined_png_bytes,
+                f"image_gen_text_p{page_index}", page_index,
             )
         step4_quality = "medium"
         yield _ndjson({
             "event": "step_start", "step": f"image_gen_text{sx}",
-            "label": f"페이지 {page_index} · 6단계 — 글자 제거 이미지 재생성 ({OPENAI_IMAGE_MODEL}, {gen_size}, {step4_quality})",
+            "label": f"페이지 {page_index} · 6단계 — 글자를 제거한 이미지 생성 ({OPENAI_IMAGE_MODEL}, {gen_size}, {step4_quality})",
             "elapsed": elapsed_total(), "page": page_index,
-            "data": {"text_prompt": text_prompt},
+            "data": {
+                "model": OPENAI_IMAGE_MODEL,
+                "quality": step4_quality,
+                "available_options": IMAGE_GEN_TEXT_OPTIONS,
+                "size": gen_size,
+                "text_prompt": text_prompt,
+                "mask_rect_count": len(matched_lines_compact),
+                "mask_rects": matched_lines_compact,
+                "mask_file": coarse_file_path,
+                "refined_mask_file": refined_file_path,
+                "refine_info": refine_info,
+                "inpainted_image_file": inpainted_file_path,
+                "inpainted_image_b64": base64.b64encode(api_input_bytes_page).decode("ascii"),
+                "base_image_b64": first_image_b64,
+                "base_image_width": first_image_width,
+                "base_image_height": first_image_height,
+                "width_px": wpx,
+                "height_px": hpx,
+            },
         })
         t0 = time.perf_counter()
+        stage_images_page: dict[str, Any] = {}
         try:
-            step3_bytes = base64.b64decode(first_image_b64)
-            img_out_v2 = await asyncio.to_thread(
-                _images_generate_sync, api_key, text_prompt, gen_size,
-                step3_bytes, "step3.png", OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY,
-                [(raw, filename)] if raw else None,
+            cp = await asyncio.to_thread(
+                _crop_paste_api_call,
+                api_key, text_prompt,
+                api_input_bytes_page, mask_png_bytes,
+                OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY,
             )
-            second_image_b64 = img_out_v2["b64_json"]
-            second_image_width = int(img_out_v2["output_width"])
-            second_image_height = int(img_out_v2["output_height"])
+            final_bytes = cp["final_bytes"]
+            second_image_b64 = base64.b64encode(final_bytes).decode("ascii")
+            second_image_width = int(cp["final_width"])
+            second_image_height = int(cp["final_height"])
+            # [DEBUG] 5개 이미지 파일로 저장
+            try:
+                _dbg_dir = _session_dir_var.get() or (_LOG_ROOT / "ad_hoc")
+                _dbg_dir.mkdir(parents=True, exist_ok=True)
+                _dbg_stamp = time.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:4]
+                def _save(name: str, data: bytes | None) -> None:
+                    if not data:
+                        return
+                    p = _dbg_dir / f"image_gen_text{sx}__{name}__{_dbg_stamp}.png"
+                    p.write_bytes(data)
+                    print(f"[image_gen_text{sx}][DEBUG] {name}: {p}")
+                _save("1_api_input", api_input_bytes_page)
+                _save("2_mask", cp.get("cropped_mask_bytes") or mask_png_bytes)
+                _save("3_cropped_sent", cp["cropped_input_bytes"])
+                _save("4_api_response", cp["api_response_bytes"])
+                _save("5_final", final_bytes)
+                print(f"[image_gen_text{sx}][DEBUG] bbox={cp['bbox']}")
+            except Exception as _dbg_ex:
+                print(f"[image_gen_text{sx}][DEBUG] 디버그 저장 실패: {_dbg_ex}")
+            stage_images_page = {
+                "api_input_b64": base64.b64encode(api_input_bytes_page).decode("ascii"),
+                "mask_b64": base64.b64encode(cp["cropped_mask_bytes"]).decode("ascii") if cp.get("cropped_mask_bytes") else (base64.b64encode(mask_png_bytes).decode("ascii") if mask_png_bytes else None),
+                "cropped_sent_b64": base64.b64encode(cp["cropped_input_bytes"]).decode("ascii") if cp["cropped_input_bytes"] else None,
+                "api_response_b64": base64.b64encode(cp["api_response_bytes"]).decode("ascii") if cp["api_response_bytes"] else None,
+                "final_b64": second_image_b64,
+                "bbox": list(cp["bbox"]) if cp["bbox"] else None,
+            }
         except Exception as ex:
             yield _ndjson({
                 "event": "step_error", "step": f"image_gen_text{sx}",
@@ -3910,6 +3702,22 @@ async def api_next_page(request: Request) -> StreamingResponse:
             })
             yield _complete("error")
             return
+        # 1차 합성 정보 (5단계 OCR 좌표 + 4단계 이미지 픽셀 색상)
+        # (step_done 직전에 계산하여 6단계 결과에 "다듬기 전 정보 preview" 를 포함)
+        sampled_lines = await asyncio.to_thread(
+            _apply_pixel_styles_to_lines,
+            base64.b64decode(first_image_b64),
+            matched_ocr_lines,
+        )
+        overlay_labels = []
+        for ln in sampled_lines:
+            if not isinstance(ln, dict):
+                continue
+            cleaned = _strip_leading_bullet(ln.get("text"))
+            if not (isinstance(cleaned, str) and cleaned.strip()):
+                continue
+            overlay_labels.append({**ln, "align": "center", "text": cleaned})
+
         yield _ndjson({
             "event": "step_done", "step": f"image_gen_text{sx}",
             "elapsed": elapsed_total(),
@@ -3919,25 +3727,69 @@ async def api_next_page(request: Request) -> StreamingResponse:
                 "image_b64": second_image_b64,
                 "image_width": second_image_width,
                 "image_height": second_image_height,
+                "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
+                "stage_images": stage_images_page,
             },
         })
 
-        # --- 7단계: 글자 합성 (removed_text_overlay) ---
-        sampled_lines = await asyncio.to_thread(
-            _apply_pixel_styles_to_lines,
-            base64.b64decode(first_image_b64),
-            matched_ocr_lines,
-        )
-        overlay_labels = [
-            {**ln, "align": "left"}
-            for ln in sampled_lines
-            if isinstance(ln, dict)
-        ]
+        # --- 7단계: 합성 정보 다듬기 (GPT 비전) ---
+        refined_labels = overlay_labels
+        refine_raw = ""
+        refine_prompt = ""
+        yield _ndjson({
+            "event": "step_start", "step": f"overlay_refine{sx}",
+            "label": f"페이지 {page_index} · 7단계 — 합성 정보 다듬기 ({OPENAI_VISION_MODEL})",
+            "elapsed": elapsed_total(), "page": page_index,
+            "data": {
+                "model": OPENAI_VISION_MODEL,
+                "reasoning_effort": OVERLAY_REFINE_DEFAULT_EFFORT,
+                "available_options": OVERLAY_REFINE_OPTIONS,
+                "input_line_count": len(overlay_labels),
+                "input_lines": overlay_labels,
+            },
+        })
+        t0 = time.perf_counter()
+        try:
+            refined_labels, refine_prompt, refine_raw = await asyncio.to_thread(
+                _refine_overlay_layout_sync,
+                api_key, OPENAI_VISION_MODEL, second_image_b64, overlay_labels,
+                second_image_width, second_image_height,
+                OVERLAY_REFINE_DEFAULT_EFFORT,
+            )
+        except Exception as ex:
+            yield _ndjson({
+                "event": "step_error", "step": f"overlay_refine{sx}",
+                "elapsed": elapsed_total(),
+                "step_elapsed": round(time.perf_counter() - t0, 2),
+                "message": str(ex), "page": page_index,
+            })
+            refined_labels = overlay_labels
+        step_elapsed = round(time.perf_counter() - t0, 2)
+        yield _ndjson({
+            "event": "step_done", "step": f"overlay_refine{sx}",
+            "elapsed": elapsed_total(), "step_elapsed": step_elapsed,
+            "page": page_index,
+            "data": {
+                "lines": refined_labels,
+                "line_count": len(refined_labels),
+                "input_lines": overlay_labels,
+                "base_image_b64": second_image_b64,
+                "base_image_width": second_image_width,
+                "base_image_height": second_image_height,
+                "refine_prompt": refine_prompt,
+                "refine_raw": refine_raw,
+            },
+        })
+
+        # --- 8단계: 다듬어진 합성 정보로 글자 합성 (canvas) ---
         yield _ndjson({
             "event": "step_start", "step": f"removed_text_overlay{sx}",
-            "label": f"페이지 {page_index} · 7단계 — 글자 제거 이미지에 글자 합성 (canvas)",
+            "label": f"페이지 {page_index} · 8단계 — 글자 제거 이미지에 글자 합성 (canvas)",
             "elapsed": elapsed_total(), "page": page_index,
-            "data": {"line_count": len(overlay_labels)},
+            "data": {"line_count": len(refined_labels)},
         })
         yield _ndjson({
             "event": "step_done", "step": f"removed_text_overlay{sx}",
@@ -3947,8 +3799,8 @@ async def api_next_page(request: Request) -> StreamingResponse:
                 "base_image_b64": second_image_b64,
                 "base_image_width": second_image_width,
                 "base_image_height": second_image_height,
-                "lines": overlay_labels,
-                "line_count": len(overlay_labels),
+                "lines": refined_labels,
+                "line_count": len(refined_labels),
             },
         })
         yield _complete("ok")
@@ -4254,3 +4106,7 @@ async def api_image_edit(
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
